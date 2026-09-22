@@ -360,6 +360,20 @@ use `uv run --no-sync` after selecting versions so the lock cannot replace them.
 Coverage and JUnit reports are retained as workflow artifacts, including failures.
 The coverage gate is 90%; measured line and branch coverage totals 94%.
 
+### Docker
+
+Build the development image and run the full test suite:
+
+```sh
+docker compose build
+docker compose run --rm app
+docker compose run --rm app uv run --no-sync ruff check .
+```
+
+The checkout is bind-mounted at `/app`, so source edits are available immediately.
+The image keeps its locked Python environment at `/opt/venv`, separate from any
+host `.venv`. Rebuild the image after changing `pyproject.toml` or `uv.lock`.
+
 ## Contributing
 
 Create a merge request and tag @kiwicom/platform for review.
