@@ -35,7 +35,9 @@ pip install sentry-structlog
 ```
 
 and replace `from structlog_sentry import SentryProcessor` with
-`from sentry_structlog import SentryProcessor`. Constructor arguments are unchanged.
+`from sentry_structlog import SentryProcessor`. Existing constructor arguments keep
+their positions. Version 3.0.0 deliberately changes tag and scrubbing defaults; see
+[Tags policy](#tags-policy).
 
 ## Usage
 
@@ -78,9 +80,13 @@ Do not forget to add the `structlog.stdlib.add_log_level` and optionally the
   Defaults to keys which are already sent separately, i.e. `level`, `logger`,
   `event` and `timestamp`. All other data in `event_dict` will be sent as
   breadcrumb data.
-- `tag_keys` A list of keys. If any if these keys appear in `event_dict`,
-  the key and its corresponding value in `event_dict` will be used as Sentry
-  event tags. use `"__all__"` to report all key/value pairs of event as tags.
+- `tag_keys` Any iterable of keys to send as tags (including lists, tuples, sets,
+  and generators), or `"__all__"` for all eligible keys. Defaults to `None` (no
+  structlog tags). Any other string raises `ValueError` during construction.
+- `exclude_tag_keys` Additional keys to exclude from tags in either mode.
+  Defaults to `()`.
+- `scrub` Apply the client's event scrubber to `contexts.structlog` and remove
+  denylisted tags. Defaults to `True`.
 - `ignore_loggers` A list of logger names to ignore any events from.
 - `verbose` Report the action taken by the logger in the `event_dict`.
   Default is `False`.
@@ -127,6 +133,11 @@ If you do not want to forward a specific logs into Sentry, you can pass the
 log.error("error message", sentry_skip=True)
 ```
 
+For captured events, tags, `contexts.structlog`, and breadcrumb data use the same
+snapshot, taken after removing `sentry_skip` and before adding `sentry_id` or
+verbose `sentry` status. Breadcrumb data still respects `ignore_breadcrumb_data`.
+Logs below `event_level` do not allocate this event snapshot.
+
 ### Sentry Tags
 
 You can set some or all of key/value pairs of structlog `event_dict` as sentry `tags`:
@@ -144,7 +155,7 @@ log.error("error message", city="Tehran", timezone="UTC+3:30", movie_title="Some
 ```
 
 this will report the error and the sentry event will have **city** and **timezone** tags.
-If you want to have all event data as tags, create the `SentryProcessor` with `tag_keys="__all__"`.
+To select all eligible event data as tags, use `tag_keys="__all__"`.
 
 ```python
 structlog.configure(
@@ -155,6 +166,53 @@ structlog.configure(
     ],...
 )
 ```
+
+### Tags policy
+
+In version 3.0.0, `tag_keys="__all__"` always excludes these reserved keys:
+`event`, `level`, `logger`, `timestamp`, `exc_info`, `exception`, `stack`,
+`stack_info`, `sentry_skip`, `sentry`, `sentry_id`, `_record`, and `_from_structlog`.
+An explicit iterable may select reserved keys. `sentry_skip` is consumed before
+the snapshot and is never included in tags or `contexts.structlog`.
+
+`exclude_tag_keys` adds consumer exclusions in both selection modes. For example,
+exclude high-cardinality or personal fields:
+
+```python
+SentryProcessor(
+    tag_keys="__all__",
+    exclude_tag_keys=("date", "username", "phone", "user_agent", "ip"),
+)
+```
+
+Tag values of type `str`, `int`, `float`, `bool`, `UUID`, `Decimal`, or `Enum`
+are converted with `str()`. `None` and other types (including dictionaries and
+lists) are dropped from tags. Values longer than **200 characters** or containing
+`\n` are also dropped, rather than truncated. Tag keys must match
+`^[a-zA-Z0-9_.:-]{1,32}$`: **1–32 characters**, using only ASCII letters, digits,
+underscores, periods, colons, and hyphens.
+
+Excluded keys and rejected values remain in `contexts.structlog` when
+`as_context=True`, subject to scrubbing; tag conversion does not stringify the
+context values.
+
+`scrub=True` is the default in 3.0.0. If the Sentry client has an `event_scrubber`,
+its `scrub_dict()` cleans a separate copy of `contexts.structlog`, respecting the
+scrubber's `recursive` setting. Tag keys matching its denylist (case-insensitively)
+are removed entirely, rather than assigned `[Filtered]`. For example:
+
+```python
+from sentry_sdk.scrubber import EventScrubber
+
+sentry_sdk.init(event_scrubber=EventScrubber(denylist=["value"], recursive=True))
+```
+
+With this scrubber, `value="secret"` and `nested={"value": "s"}` are filtered in
+the context, and `value` is omitted from tags. `scrub=False` disables these
+processor-level protections; it does not disable the tag policy above. If the
+client has no event scrubber, the processor leaves context values and eligible
+tags unchanged. Breadcrumb data is scrubbed by the SDK, including when
+`scrub=False`; the processor does not scrub it a second time.
 
 ### Skip Context
 
