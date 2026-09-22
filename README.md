@@ -152,6 +152,45 @@ processor, make that the `SentryProcessor` comes _before_ `format_exc_info`!
 Otherwise, the `SentryProcessor` won't have an `exc_info` to work with, because
 it's removed from the event by `format_exc_info`.
 
+Exception events are marked with `mechanism={"type": "structlog", "handled": True}`.
+When both `exc_info` and `stack_info` are requested and an exception is available,
+the exception's traceback takes priority; no additional thread stack is attached.
+
+To capture the current thread's structured stack without an exception, use:
+
+```python
+log.error("current call site", stack_info=True)
+log.error("current call site", exc_info=True)  # when no exception is active
+```
+
+These calls attach one stack in `threads.values`, with `crashed=False` and
+`current=True`, even when the Sentry client's `attach_stacktrace=False`. Per-call
+stack capture respects the client's `include_local_variables`,
+`include_source_context`, and `max_value_length` options. With
+`attach_stacktrace=True`, the SDK client supplies the stack; the processor does
+not capture another one. Plain events without either flag only get a stack when
+the client's `attach_stacktrace` option is enabled.
+
+Place `SentryProcessor` **before** `structlog.processors.StackInfoRenderer` so it
+can read the raw `stack_info` flag, for example:
+
+```python
+structlog.configure(processors=[
+    structlog.stdlib.add_log_level,
+    SentryProcessor(),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.JSONRenderer(),
+])
+```
+
+`SentryProcessor` leaves `exc_info`, `stack_info`, and `stack` unchanged for
+downstream processors. If `StackInfoRenderer` has already run, it has removed
+`stack_info`: the remaining rendered `stack` string is preserved as context
+(subject to scrubbing and SDK serialization), but is not converted back into a
+structured traceback. Global `attach_stacktrace` still works in that order.
+`stack_info` and `stack` remain reserved keys excluded by `tag_keys="__all__"`.
+
 Logging calls with no `sys.exc_info()` are also automatically captured by Sentry
 either as breadcrumbs (if configured by the `level` argument) or as events:
 
