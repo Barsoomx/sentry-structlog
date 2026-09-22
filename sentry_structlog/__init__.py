@@ -54,6 +54,7 @@ _TAG_KEY_PATTERN = re.compile(r"[a-zA-Z0-9_.:-]{1,32}")
 
 
 def _to_tag_value(value: object) -> str | None:
+    __tracebackhide__ = True
     if not isinstance(value, (str, int, float, bool, UUID, Decimal, Enum)):
         return None
     value = str(value)
@@ -62,13 +63,22 @@ def _to_tag_value(value: object) -> str | None:
     return value
 
 
-def _copy_scrub_data(value: Any) -> Any:
-    """Copy containers the scrubber mutates, leaving opaque log values untouched."""
+def _copy_scrub_data(value: Any, memo: set[int] | None = None) -> Any:
+    """Copy containers, replacing repeated references and preserving opaque values."""
+    __tracebackhide__ = True
+    if not isinstance(value, (dict, list, tuple)):
+        return value
+    if memo is None:
+        memo = set()
+    identity = id(value)
+    if identity in memo:
+        return "<cyclic reference>"
+    memo.add(identity)
     if isinstance(value, dict):
-        return {key: _copy_scrub_data(item) for key, item in value.items()}
+        return {key: _copy_scrub_data(item, memo) for key, item in value.items()}
     if isinstance(value, list):
-        return [_copy_scrub_data(item) for item in value]
-    return value
+        return [_copy_scrub_data(item, memo) for item in value]
+    return tuple(_copy_scrub_data(item, memo) for item in value)
 
 
 def _figure_out_exc_info(v: Any) -> ExcInfo | None:
@@ -77,6 +87,7 @@ def _figure_out_exc_info(v: Any) -> ExcInfo | None:
     to transform *v* into an ``exc_info`` tuple. Falsy flags become ``None``;
     the empty ``sys.exc_info()`` tuple is preserved to request a stack trace.
     """
+    __tracebackhide__ = True
     if isinstance(v, BaseException):
         return (v.__class__, v, v.__traceback__)
     elif isinstance(v, tuple):
@@ -172,6 +183,7 @@ class SentryProcessor:
         :param logger: logger instance
         :param event_dict: structlog event_dict
         """
+        __tracebackhide__ = True
         l_name = event_dict.get("logger")
         if isinstance(l_name, str) and l_name:
             return l_name
@@ -187,10 +199,12 @@ class SentryProcessor:
         return None
 
     def _get_scope(self) -> Scope:
+        __tracebackhide__ = True
         return self._scope or get_isolation_scope()
 
     @staticmethod
     def _get_hint(event_dict: EventDict) -> Hint:
+        __tracebackhide__ = True
         hint: Hint = {"structlog": dict(event_dict)}
         record = event_dict.get("_record")
         if isinstance(record, logging.LogRecord):
@@ -207,6 +221,7 @@ class SentryProcessor:
             `sentry_skip`, before capturing the event; used for tags and context.
             Defaults to `event_dict` itself.
         """
+        __tracebackhide__ = True
         if original_event_dict is None:
             original_event_dict = event_dict
 
@@ -229,18 +244,27 @@ class SentryProcessor:
                 "attach_stacktrace"
             ):
                 with capture_internal_exceptions():
+                    stacktrace = current_stacktrace(
+                        include_local_variables=options.get(
+                            "include_local_variables", True
+                        ),
+                        include_source_context=options.get(
+                            "include_source_context", True
+                        ),
+                        max_value_length=options.get("max_value_length"),
+                    )
+                    # Nonrecursive SDK scrubbing cannot clean nested event_dict locals.
+                    stacktrace["frames"] = [
+                        frame
+                        for frame in stacktrace["frames"]
+                        if not (frame.get("module") or "").startswith(
+                            ("sentry_structlog", "structlog", "logging")
+                        )
+                    ]
                     event["threads"] = {
                         "values": [
                             {
-                                "stacktrace": current_stacktrace(
-                                    include_local_variables=options.get(
-                                        "include_local_variables", True
-                                    ),
-                                    include_source_context=options.get(
-                                        "include_source_context", True
-                                    ),
-                                    max_value_length=options.get("max_value_length"),
-                                ),
+                                "stacktrace": stacktrace,
                                 "crashed": False,
                                 "current": True,
                             }
@@ -250,8 +274,9 @@ class SentryProcessor:
         # Structlog permits missing/dynamic values; preserve them for the SDK.
         event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
         event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
-        if "logger" in event_dict:
-            event["logger"] = event_dict["logger"]
+        logger_name = event_dict.get("logger")
+        if isinstance(logger_name, str):
+            event["logger"] = logger_name
 
         scrubber = (
             self._get_scope().get_client().options.get("event_scrubber")
@@ -259,11 +284,7 @@ class SentryProcessor:
             else None
         )
         if self._as_context:
-            context = (
-                _copy_scrub_data(original_event_dict)
-                if scrubber is not None and scrubber.recursive
-                else dict(original_event_dict)
-            )
+            context = _copy_scrub_data(original_event_dict)
             if isinstance(context.get("_record"), logging.LogRecord):
                 context.pop("_record")
             if scrubber is not None:
@@ -293,24 +314,27 @@ class SentryProcessor:
     def _get_breadcrumb_and_hint(
         self, event_dict: EventDict
     ) -> tuple[Breadcrumb, Hint]:
+        __tracebackhide__ = True
         data = {
             k: v
             for k, v in event_dict.items()
             if k not in self.ignore_breadcrumb_data
             and not (k == "_record" and isinstance(v, logging.LogRecord))
         }
+        logger_name = event_dict.get("logger")
         event: Breadcrumb = {
             "type": "log",
             "level": event_dict.get("level"),
-            "category": event_dict.get("logger"),
+            "category": logger_name if isinstance(logger_name, str) else None,
             "message": event_dict["event"],
             "timestamp": event_dict.get("timestamp"),
-            "data": data,
+            "data": _copy_scrub_data(data),
         }
 
         return event, self._get_hint(event_dict)
 
     def _can_record(self, logger_name: str | None, event_dict: EventDict) -> bool:
+        __tracebackhide__ = True
         if logger_name:
             for ignored_logger in _IGNORED_LOGGERS | self._ignored_loggers:
                 if fnmatch(logger_name, ignored_logger):
@@ -326,9 +350,10 @@ class SentryProcessor:
         sentry_level: LogLevelStr | None = None,
         logger_name: str | None = None,
     ) -> None:
+        __tracebackhide__ = True
         with capture_internal_exceptions():
             event, hint = self._get_event_and_hint(event_dict, original_event_dict)
-            if "logger" not in event_dict and logger_name is not None:
+            if logger_name is not None:
                 event["logger"] = logger_name
             if sentry_level is not None:
                 event["level"] = sentry_level
@@ -344,9 +369,10 @@ class SentryProcessor:
         sentry_level: str | None = None,
         logger_name: str | None = None,
     ) -> None:
+        __tracebackhide__ = True
         with capture_internal_exceptions():
             event, hint = self._get_breadcrumb_and_hint(event_dict)
-            if "logger" not in event_dict and logger_name is not None:
+            if logger_name is not None:
                 event["category"] = logger_name
             if sentry_level is not None:
                 event["level"] = sentry_level
@@ -355,6 +381,7 @@ class SentryProcessor:
     @staticmethod
     def _resolve_level(event_dict: EventDict) -> int | None:
         """Prefer a numeric level, then structlog aliases and registered names."""
+        __tracebackhide__ = True
         level = event_dict.get("level_number")
         if isinstance(level, int):
             return level
@@ -376,6 +403,7 @@ class SentryProcessor:
     @staticmethod
     def _get_sentry_level(level: int) -> LogLevelStr:
         """Map numeric ranges to Sentry severities, including custom levels."""
+        __tracebackhide__ = True
         if level >= logging.CRITICAL:
             return "fatal"
         if level >= logging.ERROR:
@@ -390,6 +418,7 @@ class SentryProcessor:
         self, logger: WrappedLogger, name: str, event_dict: EventDict
     ) -> EventDict:
         """A middleware to process structlog `event_dict` and send it to Sentry."""
+        __tracebackhide__ = True
         try:
             with capture_internal_exceptions():
                 sentry_skip = event_dict.pop("sentry_skip", False)
