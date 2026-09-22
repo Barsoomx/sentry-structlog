@@ -414,7 +414,7 @@ uv sync --all-groups
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy sentry_structlog
+uv run --no-sync mypy --strict sentry_structlog
 uv build
 uv run twine check --strict dist/*
 ```
@@ -425,6 +425,15 @@ plus minimum and latest stable Sentry SDK/structlog versions. The endpoint lanes
 use `uv run --no-sync` after selecting versions so the lock cannot replace them.
 Coverage and JUnit reports are retained as workflow artifacts, including failures.
 The coverage gate is 90%; measured line and branch coverage totals 94%.
+
+The package ships inline types and a `py.typed` marker in both distributions.
+Mypy 1.20.0 checks the package in strict mode against installed Sentry SDK and
+structlog types; the pre-commit hook also installs both dependencies. The default
+mypy target is `sentry_structlog`, excluding the test suite. CI installs the built
+wheel into a clean environment and runs `scripts/wheel_consumer.py` outside the
+checkout, both at runtime and with strict mypy targeting Python 3.10. The consumer
+checks processor compatibility, tuple tag keys, exclusions, scrubbing,
+`RESERVED_TAG_KEYS`, and an SDK-typed `before_send` callback using `hint["structlog"]`.
 
 ### Docker
 

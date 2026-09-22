@@ -60,7 +60,8 @@ known-first-party = ["sentry_structlog"]
 
 [tool.mypy]
 python_version = "3.10"
-check_untyped_defs = true
+files = ["sentry_structlog"]
+strict = true
 warn_unused_configs = true
 show_error_codes = true
 
