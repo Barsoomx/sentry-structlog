@@ -1,5 +1,8 @@
 services:
-  app:
+  app: &app
     build: .
     volumes:
       - .:/app
+  e2e:
+    <<: *app
+    command: uv run --no-sync pytest -m e2e test/e2e -q
