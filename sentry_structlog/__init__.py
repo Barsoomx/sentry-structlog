@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from collections.abc import Iterable, MutableMapping
 from decimal import Decimal
 from enum import Enum
 from fnmatch import fnmatch
 from typing import Any, Optional
-from collections.abc import MutableMapping, Iterable
 from uuid import UUID
 
 from sentry_sdk import Scope, get_isolation_scope
@@ -18,7 +18,9 @@ from structlog.types import EventDict, ExcInfo, WrappedLogger
 try:
     from structlog.processors import NAME_TO_LEVEL
 except ImportError:  # Older structlog versions expose the same mapping privately.
-    from structlog.processors import _NAME_TO_LEVEL as NAME_TO_LEVEL
+    from structlog.processors import (  # type: ignore[attr-defined,no-redef]
+        _NAME_TO_LEVEL as NAME_TO_LEVEL,
+    )
 
 
 RESERVED_TAG_KEYS = frozenset(
@@ -123,6 +125,7 @@ class SentryProcessor:
         self.event_level = event_level
         self.level = level
         self.active = active
+        self.tag_keys: frozenset[str] | str | None
         if isinstance(tag_keys, str):
             if tag_keys != "__all__":
                 raise ValueError('tag_keys must be "__all__" or an iterable of keys')
@@ -194,8 +197,8 @@ class SentryProcessor:
         else:
             event, hint = {}, {}
 
-        event["message"] = event_dict.get("event")
-        event["level"] = event_dict.get("level")
+        event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
+        event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
         if "logger" in event_dict:
             event["logger"] = event_dict["logger"]
 
@@ -232,7 +235,7 @@ class SentryProcessor:
                     tags[key] = tag_value
             event["tags"] = tags
 
-        return event, hint
+        return event, hint  # type: ignore[return-value]
 
     def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
         data = {
@@ -269,7 +272,7 @@ class SentryProcessor:
             event, hint = self._get_event_and_hint(event_dict, original_event_dict)
             if sentry_level is not None:
                 event["level"] = sentry_level
-            sid = self._get_scope().capture_event(event, hint=hint)
+            sid = self._get_scope().capture_event(event, hint=hint)  # type: ignore[arg-type]
             if sid:
                 event_dict["sentry_id"] = sid
             if self.verbose:
