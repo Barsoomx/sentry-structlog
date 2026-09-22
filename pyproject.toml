@@ -37,6 +37,12 @@ Changelog = "https://github.com/Barsoomx/sentry-structlog/blob/master/CHANGELOG.
 Upstream = "https://github.com/kiwicom/structlog-sentry"
 
 [dependency-groups]
+e2e = [
+    "django>=5.2",
+    "django-structlog>=9",
+    "granian>=2",
+    "requests>=2.32",
+]
 dev = [
     "pytest>=8",
     "pytest-mock>=3.8.2",
@@ -71,6 +77,8 @@ show_error_codes = true
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+addopts = "-m 'not e2e'"
+markers = ["e2e: Django/Granian end-to-end concurrency tests (opt in)"]
 
 [tool.coverage.run]
 branch = true
