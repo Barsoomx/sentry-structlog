@@ -28,8 +28,8 @@ __all__ = ["SentryProcessor", "RESERVED_TAG_KEYS"]
 try:
     from structlog.processors import NAME_TO_LEVEL
 except ImportError:  # Older structlog versions expose the same mapping privately.
-    from structlog.processors import (  # type: ignore[attr-defined,no-redef] # pyright: ignore[reportAttributeAccessIssue]
-        _NAME_TO_LEVEL as NAME_TO_LEVEL,
+    from structlog.processors import (  # type: ignore[attr-defined,no-redef]
+        _NAME_TO_LEVEL as NAME_TO_LEVEL,  # pyright: ignore[reportAttributeAccessIssue]
     )
 
 

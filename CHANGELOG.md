@@ -29,6 +29,11 @@ For version 2.2.1 and earlier, see the
   wheel consumer check on the minimum/latest dependency lanes.
 - Release workflow publishes the artifact that passed the test workflow.
 
+### Removed
+
+- The non-blocking Sentry SDK 3.x prerelease lane: the 3.x line has had no
+  prerelease since 3.0.0a7 (2025-10) while 2.x remains the active line.
+
 ## [3.0.0] - 2026-09-23
 
 ### Changed

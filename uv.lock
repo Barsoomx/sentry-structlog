@@ -1241,7 +1241,7 @@ wheels = [
 
 [[package]]
 name = "sentry-structlog"
-version = "3.0.0"
+version = "3.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "sentry-sdk" },
