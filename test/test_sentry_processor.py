@@ -14,7 +14,7 @@ import structlog
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.scrubber import EventScrubber
 
-from sentry_structlog import SentryProcessor
+from sentry_structlog import SentryProcessor, _figure_out_exc_info
 
 INTEGRATIONS = [
     LoggingIntegration(event_level=None, level=None),
@@ -485,6 +485,11 @@ def test_per_call_stack_without_exception(sentry_events, flags):
     assert "stacktrace" not in event
     assert event["tags"] == {}
     assert {key: downstream[key] for key in flags} == flags
+
+
+@pytest.mark.parametrize("value", [None, False, 0, "", []])
+def test_falsy_exc_info_is_normalized_to_none(value):
+    assert _figure_out_exc_info(value) is None
 
 
 @pytest.mark.parametrize("flags", [{}, {"exc_info": False, "stack_info": False}])

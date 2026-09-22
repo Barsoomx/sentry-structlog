@@ -8,7 +8,7 @@ from collections.abc import Iterable, MutableMapping
 from decimal import Decimal
 from enum import Enum
 from fnmatch import fnmatch
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 from uuid import UUID
 
 from sentry_sdk import Scope, get_isolation_scope
@@ -18,7 +18,12 @@ from sentry_sdk.utils import (
     current_stacktrace,
     event_from_exception,
 )
-from structlog.types import EventDict, ExcInfo, WrappedLogger
+from structlog.types import EventDict, WrappedLogger
+
+if TYPE_CHECKING:
+    from sentry_sdk._types import Breadcrumb, Event, ExcInfo, Hint, LogLevelStr
+
+__all__ = ["SentryProcessor", "RESERVED_TAG_KEYS"]
 
 try:
     from structlog.processors import NAME_TO_LEVEL
@@ -48,7 +53,7 @@ RESERVED_TAG_KEYS = frozenset(
 _TAG_KEY_PATTERN = re.compile(r"[a-zA-Z0-9_.:-]{1,32}")
 
 
-def _to_tag_value(value: Any) -> str | None:
+def _to_tag_value(value: object) -> str | None:
     if not isinstance(value, (str, int, float, bool, UUID, Decimal, Enum)):
         return None
     value = str(value)
@@ -66,19 +71,20 @@ def _copy_scrub_data(value: Any) -> Any:
     return value
 
 
-def _figure_out_exc_info(v: Any) -> ExcInfo:
+def _figure_out_exc_info(v: Any) -> ExcInfo | None:
     """
     Depending on the Python version will try to do the smartest thing possible
-    to transform *v* into an ``exc_info`` tuple.
+    to transform *v* into an ``exc_info`` tuple. Falsy flags become ``None``;
+    the empty ``sys.exc_info()`` tuple is preserved to request a stack trace.
     """
     if isinstance(v, BaseException):
         return (v.__class__, v, v.__traceback__)
     elif isinstance(v, tuple):
-        return v  # type: ignore
+        return cast("ExcInfo", v)
     elif v:
-        return sys.exc_info()  # type: ignore
+        return sys.exc_info()
 
-    return v
+    return None
 
 
 class SentryProcessor:
@@ -184,8 +190,8 @@ class SentryProcessor:
         return self._scope or get_isolation_scope()
 
     @staticmethod
-    def _get_hint(event_dict: EventDict) -> dict[str, Any]:
-        hint: dict[str, Any] = {"structlog": dict(event_dict)}
+    def _get_hint(event_dict: EventDict) -> Hint:
+        hint: Hint = {"structlog": dict(event_dict)}
         record = event_dict.get("_record")
         if isinstance(record, logging.LogRecord):
             hint["log_record"] = record
@@ -193,7 +199,7 @@ class SentryProcessor:
 
     def _get_event_and_hint(
         self, event_dict: EventDict, original_event_dict: EventDict | None = None
-    ) -> tuple[dict, dict]:
+    ) -> tuple[Event, Hint]:
         """Create a sentry event and hint from structlog `event_dict` and sys.exc_info.
 
         :param event_dict: structlog event_dict
@@ -205,11 +211,11 @@ class SentryProcessor:
             original_event_dict = event_dict
 
         exc_info = _figure_out_exc_info(event_dict.get("exc_info", None))
-        has_exc_info = exc_info and exc_info != (None, None, None)
         client = self._get_scope().get_client()
         options: dict[str, Any] = client.options if client else {}
 
-        if has_exc_info:
+        event: Event
+        if exc_info and exc_info != (None, None, None):
             event, hint = event_from_exception(
                 exc_info,
                 client_options=options,
@@ -240,6 +246,7 @@ class SentryProcessor:
                         ]
                     }
 
+        # Structlog permits missing/dynamic values; preserve them for the SDK.
         event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
         event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
         if "logger" in event_dict:
@@ -280,18 +287,20 @@ class SentryProcessor:
                     tags[key] = tag_value
             event["tags"] = tags
 
-        return event, {**hint, **self._get_hint(original_event_dict)}  # type: ignore[return-value]
+        return event, {**hint, **self._get_hint(original_event_dict)}
 
-    def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
+    def _get_breadcrumb_and_hint(
+        self, event_dict: EventDict
+    ) -> tuple[Breadcrumb, Hint]:
         data = {
             k: v
             for k, v in event_dict.items()
             if k not in self.ignore_breadcrumb_data
             and not (k == "_record" and isinstance(v, logging.LogRecord))
         }
-        event = {
+        event: Breadcrumb = {
             "type": "log",
-            "level": event_dict.get("level"),  # type: ignore
+            "level": event_dict.get("level"),
             "category": event_dict.get("logger"),
             "message": event_dict["event"],
             "timestamp": event_dict.get("timestamp"),
@@ -303,7 +312,7 @@ class SentryProcessor:
     def _can_record(self, logger_name: str | None, event_dict: EventDict) -> bool:
         if logger_name:
             for ignored_logger in _IGNORED_LOGGERS | self._ignored_loggers:
-                if fnmatch(logger_name, ignored_logger):  # type: ignore
+                if fnmatch(logger_name, ignored_logger):
                     if self.verbose:
                         event_dict["sentry"] = "ignored"
                     return False
@@ -313,7 +322,7 @@ class SentryProcessor:
         self,
         event_dict: EventDict,
         original_event_dict: EventDict | None = None,
-        sentry_level: str | None = None,
+        sentry_level: LogLevelStr | None = None,
         logger_name: str | None = None,
     ) -> None:
         with capture_internal_exceptions():
@@ -322,7 +331,7 @@ class SentryProcessor:
                 event["logger"] = logger_name
             if sentry_level is not None:
                 event["level"] = sentry_level
-            sid = self._get_scope().capture_event(event, hint=hint)  # type: ignore[arg-type]
+            sid = self._get_scope().capture_event(event, hint=hint)
             if sid:
                 event_dict["sentry_id"] = sid
             if self.verbose:
@@ -364,7 +373,7 @@ class SentryProcessor:
         return None
 
     @staticmethod
-    def _get_sentry_level(level: int) -> str:
+    def _get_sentry_level(level: int) -> LogLevelStr:
         """Map numeric ranges to Sentry severities, including custom levels."""
         if level >= logging.CRITICAL:
             return "fatal"
