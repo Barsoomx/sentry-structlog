@@ -175,10 +175,11 @@ The `SentryProcessor` class takes the following arguments:
 Add `structlog.stdlib.add_log_level` (or `add_log_level_number`) before the
 processor. `add_logger_name` is optional and also belongs before it. Names are
 resolved from non-empty strings in `event_dict["logger"]`, `_record.name`, then
-the wrapped logger's `name`. If the event dict has no `logger` key, the resolved
-name supplies the Sentry event logger and breadcrumb category without changing
-original event data. `CapturingLogger` and mock loggers without a string name
-are supported.
+the wrapped logger's `name`. The resolved name supplies the Sentry event logger
+and breadcrumb category even when the event dict's `logger` is `None`, empty,
+or not a string, without changing original event data. Without a resolved name,
+non-string values are omitted from the event logger and breadcrumb category.
+`CapturingLogger` and mock loggers without a string name are supported.
 
 ### Capture status
 
@@ -251,6 +252,8 @@ stack in `threads.values`, with `crashed=False` and `current=True`, even when
 `include_local_variables`, `include_source_context`, and `max_value_length`
 options. With `attach_stacktrace=True`, the SDK supplies the stack instead.
 Plain events without either flag only get a stack when that client option is on.
+Stacks captured by the processor omit `sentry_structlog`, `structlog`, and
+`logging` frames so raw log data in their locals cannot bypass context scrubbing.
 
 The processor leaves `exc_info`, `stack_info`, and `stack` unchanged for
 subsequent processors. If `StackInfoRenderer` ran first, the rendered `stack`
@@ -366,10 +369,16 @@ sentry_sdk.init(
 With this scrubber, `value="secret"` and `nested={"value": "s"}` are filtered in
 the context, and `value` is omitted from tags. `scrub=False` disables these
 processor-level protections; it does not disable the tag policy above. If the
-client has no event scrubber, the processor leaves context values and eligible
-tags unchanged. When configured, the SDK's event scrubber handles breadcrumb
+client has no event scrubber, the processor does not scrub context values or
+eligible tags. When configured, the SDK's event scrubber handles breadcrumb
 data while preparing the containing event, even with `scrub=False`; the
 processor does not scrub it a second time.
+
+Context and breadcrumb data use separate copies of dictionaries, lists, and
+tuples. Repeated references to these containers become `"<cyclic reference>"`,
+including shared containers without a cycle, so recursive scrubbing and
+serialization can finish. This also applies with `scrub=False` or no client
+scrubber. Original log values and callback hints remain unchanged.
 
 ### Scopes and thread isolation
 

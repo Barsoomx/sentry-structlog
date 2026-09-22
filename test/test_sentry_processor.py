@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 import threading
@@ -5,8 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
+from io import StringIO
 from unittest.mock import Mock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import sentry_sdk
@@ -487,6 +489,60 @@ def test_per_call_stack_without_exception(sentry_events, flags):
     assert {key: downstream[key] for key in flags} == flags
 
 
+@pytest.mark.parametrize(
+    "sentry_events", [{"include_local_variables": True}], indirect=True
+)
+@pytest.mark.parametrize("flag", ["stack_info", "exc_info"])
+@pytest.mark.parametrize("use_formatter", [False, True])
+def test_per_call_stack_does_not_leak_log_password(sentry_events, flag, use_formatter):
+    processor = SentryProcessor(tag_keys="__all__")
+    if use_formatter:
+        logger = logging.Logger("stack.logger")
+        handler = logging.StreamHandler(StringIO())
+        handler.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processors=[
+                    processor,
+                    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                    structlog.processors.JSONRenderer(),
+                ]
+            )
+        )
+        logger.addHandler(handler)
+        processors = [structlog.stdlib.ProcessorFormatter.wrap_for_formatter]
+    else:
+        logger = structlog.ReturnLogger()
+        processors = [processor]
+    log = structlog.wrap_logger(
+        logger,
+        wrapper_class=structlog.stdlib.BoundLogger,
+        processors=[structlog.stdlib.add_log_level, *processors],
+    )
+    # A generated value avoids embedding the password in captured source context.
+    password = str(uuid4())
+    assert sys.exc_info() == (None, None, None)
+
+    log.error("stack requested", password=password, **{flag: True})
+
+    [event] = sentry_events
+    assert password not in json.dumps(event, default=str)
+    assert event["contexts"]["structlog"]["password"] == "[Filtered]"
+    assert event["tags"] == {}
+    frames = event["threads"]["values"][0]["stacktrace"]["frames"]
+    assert all(
+        not (frame.get("module") or "").startswith(
+            ("sentry_structlog", "structlog", "logging")
+        )
+        for frame in frames
+    )
+    [test_frame] = [
+        frame
+        for frame in frames
+        if frame["function"] == "test_per_call_stack_does_not_leak_log_password"
+    ]
+    assert test_frame["vars"]["password"] == "[Filtered]"
+
+
 @pytest.mark.parametrize("value", [None, False, 0, "", []])
 def test_falsy_exc_info_is_normalized_to_none(value):
     assert _figure_out_exc_info(value) is None
@@ -745,6 +801,13 @@ def test_logger_name_is_resolved_once_for_filter_and_payloads(sentry_events):
     "logger, record_name, event_name, expected_name",
     [
         (logging.getLogger("wrapped.logger"), absent, absent, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), absent, None, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), absent, 42, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), absent, "", "wrapped.logger"),
+        (None, "record.logger", absent, "record.logger"),
+        (MockLogger("wrapped.logger"), "record.logger", None, "record.logger"),
+        (MockLogger("wrapped.logger"), "record.logger", 42, "record.logger"),
+        (MockLogger("wrapped.logger"), "record.logger", "", "record.logger"),
         (Mock(), "record.logger", absent, "record.logger"),
         (structlog.testing.CapturingLogger(), "record.logger", absent, "record.logger"),
         (MockLogger(None), "record.logger", absent, "record.logger"),
@@ -780,6 +843,23 @@ def test_resolved_logger_name_is_used_in_payloads(
         key: value for key, value in event_data.items() if key != "sentry_id"
     } == original
     assert ("logger" in first["contexts"]["structlog"]) == (event_name is not absent)
+
+
+@pytest.mark.parametrize("event_name", [None, 42, Mock(), lambda: "name"])
+def test_nonstring_logger_without_fallback_is_omitted(sentry_events, event_name):
+    processor = SentryProcessor()
+    event_data = {"level": "error", "event": "first", "logger": event_name}
+
+    event, _ = processor._get_event_and_hint(event_data)
+    assert "logger" not in event
+    processor(None, "error", event_data)
+    sentry_sdk.capture_message("flush breadcrumb")
+
+    first, second = sentry_events
+    assert "logger" not in first
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb.get("category") is None
+    assert event_data["logger"] is event_name
 
 
 @pytest.mark.parametrize("event_name", [None, "", 42, Mock(), lambda: "name"])
@@ -1444,6 +1524,92 @@ def test_scrubbing_respects_nonrecursive_client_setting(sentry_events):
     assert event["tags"] == {}
     assert event["contexts"]["structlog"]["value"] == "[Filtered]"
     assert event["contexts"]["structlog"]["nested"] == {"value": "s"}
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [
+        {"event_scrubber": EventScrubber(recursive=True)},
+        {"event_scrubber": EventScrubber()},
+    ],
+    indirect=True,
+    ids=["recursive", "nonrecursive"],
+)
+@pytest.mark.parametrize("scrub", [True, False])
+@pytest.mark.parametrize("container", ["dict", "list", "tuple"])
+def test_cyclic_kwargs_are_delivered_without_mutation(
+    sentry_events, sentry_hints, scrub, container
+):
+    if container == "dict":
+        value = {}
+        value["self"] = value
+        expected = {"self": "<cyclic reference>"}
+    elif container == "list":
+        value = []
+        value.append({"self": value})
+        expected = [{"self": "<cyclic reference>"}]
+    else:
+        items = []
+        value = (items,)
+        items.append(value)
+        expected = [["<cyclic reference>"]]
+    nested = {"child": {"cycle": value, "password": "nested password"}}
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[
+            structlog.stdlib.add_log_level,
+            SentryProcessor(scrub=scrub, tag_keys="__all__"),
+        ],
+    )
+
+    _, downstream = log.error("cyclic kwargs", nested=nested, password="top password")
+    sentry_sdk.capture_message("flush breadcrumb")
+
+    first, second = sentry_events
+    context = first["contexts"]["structlog"]
+    assert context["nested"]["child"]["cycle"] == expected
+    assert context["password"] == ("[Filtered]" if scrub else "top password")
+    recursive = sentry_sdk.get_client().options["event_scrubber"].recursive
+    assert context["nested"]["child"]["password"] == (
+        "[Filtered]" if scrub and recursive else "nested password"
+    )
+    assert first["tags"] == ({} if scrub else {"password": "top password"})
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    # The SDK may stringify deeply nested breadcrumb values at its depth limit.
+    assert "<cyclic reference>" in json.dumps(
+        breadcrumb["data"]["nested"]["child"]["cycle"]
+    )
+    assert breadcrumb["data"]["password"] == "[Filtered]"
+    assert breadcrumb["data"]["nested"]["child"]["password"] == (
+        "[Filtered]" if recursive else "nested password"
+    )
+    assert downstream["nested"] is nested
+    assert nested["child"]["password"] == "nested password"
+    assert downstream["password"] == "top password"
+    if container == "dict":
+        assert value["self"] is value
+    elif container == "list":
+        assert value[0]["self"] is value
+    else:
+        assert value[0][0] is value
+    assert sentry_hints["events"][0]["structlog"]["nested"] is nested
+    assert sentry_hints["breadcrumbs"][0]["structlog"]["nested"] is nested
+
+
+@pytest.mark.parametrize("container", [dict, list, tuple])
+def test_repeated_containers_use_cycle_marker(sentry_events, container):
+    value = container()
+    SentryProcessor(tag_keys="__all__")(
+        None, "error", {"level": "error", "event": "aliases", "values": [value, value]}
+    )
+    sentry_sdk.capture_message("flush breadcrumb")
+
+    first, second = sentry_events
+    expected = [{} if container is dict else [], "<cyclic reference>"]
+    assert first["contexts"]["structlog"]["values"] == expected
+    assert first["tags"] == {}
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb["data"]["values"] == expected
 
 
 def test_capture_without_client_scrubber(sentry_events, monkeypatch):
