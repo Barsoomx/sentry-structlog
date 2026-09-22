@@ -207,13 +207,26 @@ sentry_sdk.init(integrations=INTEGRATIONS)
 
 This integration tells `sentry_sdk` to _ignore_ standard logging and captures the events manually.
 
-## Testing
+## Development
 
-To run all tests:
+Use Python 3.10 or newer and [uv](https://docs.astral.sh/uv/):
 
+```sh
+uv sync --all-groups
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy sentry_structlog
+uv build
+uv run twine check --strict dist/*
 ```
-tox
-```
+
+`uv sync` also installs the default `dev` group. Commit `uv.lock` when updating
+dependencies. CI tests Python 3.10–3.14 on Ubuntu and Python 3.12 on Windows 2022,
+plus minimum and latest stable Sentry SDK/structlog versions. The endpoint lanes
+use `uv run --no-sync` after selecting versions so the lock cannot replace them.
+Coverage and JUnit reports are retained as workflow artifacts, including failures.
+The coverage gate is 90%; measured line and branch coverage totals 94%.
 
 ## Contributing
 
@@ -221,7 +234,7 @@ Create a merge request and tag @kiwicom/platform for review.
 
 ## Releasing
 
-Set `tool.poetry.version` in `pyproject.toml`, commit the changes, and push to
+Set `project.version` in `pyproject.toml`, commit the changes, and push to
 `master`. The `Publish to PyPI` workflow builds and checks the wheel and source
 distribution. Once the checks pass, push the matching version tag, for example:
 

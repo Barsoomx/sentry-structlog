@@ -153,5 +153,10 @@ com_crashlytics_export_strings.xml
 crashlytics.properties
 crashlytics-build.properties
 
-# local tooling artefacts
-uv.lock
+# Local tooling artifacts
+.venv/
+.venv-wheel/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+junit.xml

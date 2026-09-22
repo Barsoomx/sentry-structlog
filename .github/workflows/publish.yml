@@ -27,7 +27,7 @@ jobs:
           import tomllib
           from pathlib import Path
 
-          project = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["poetry"]
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
           expected_tag = f"v{project['version']}"
           actual_tag = os.environ["GITHUB_REF_NAME"]
           if actual_tag != expected_tag:
@@ -57,9 +57,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   publish:
     name: Publish with PyPI Trusted Publishing
-    needs: build
+    needs: [build, tests]
     if: github.repository == 'Barsoomx/sentry-structlog' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
+
 from sentry_structlog import SentryProcessor
 
 INTEGRATIONS = [

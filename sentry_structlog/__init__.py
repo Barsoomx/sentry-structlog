@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable, MutableMapping
 from fnmatch import fnmatch
 from typing import Any, Optional
-from collections.abc import MutableMapping, Iterable
 
 from sentry_sdk import Scope, get_isolation_scope
 from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
@@ -135,8 +135,8 @@ class SentryProcessor:
         else:
             event, hint = {}, {}
 
-        event["message"] = event_dict.get("event")
-        event["level"] = event_dict.get("level")
+        event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
+        event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
         if "logger" in event_dict:
             event["logger"] = event_dict["logger"]
 
@@ -149,7 +149,7 @@ class SentryProcessor:
                 key: event_dict[key] for key in self.tag_keys if key in event_dict
             }
 
-        return event, hint
+        return event, hint  # type: ignore[return-value]
 
     def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
         data = {
@@ -181,7 +181,7 @@ class SentryProcessor:
     ) -> None:
         with capture_internal_exceptions():
             event, hint = self._get_event_and_hint(event_dict, original_event_dict)
-            sid = self._get_scope().capture_event(event, hint=hint)
+            sid = self._get_scope().capture_event(event, hint=hint)  # type: ignore[arg-type]
             if sid:
                 event_dict["sentry_id"] = sid
             if self.verbose:
