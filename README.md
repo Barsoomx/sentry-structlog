@@ -218,3 +218,21 @@ tox
 ## Contributing
 
 Create a merge request and tag @kiwicom/platform for review.
+
+## Releasing
+
+Set `tool.poetry.version` in `pyproject.toml`, commit the changes, and push to
+`master`. The `Publish to PyPI` workflow builds and checks the wheel and source
+distribution. Once the checks pass, push the matching version tag, for example:
+
+```sh
+git tag v3.0.0
+git push origin v3.0.0
+```
+
+Tags must match the package version exactly. The tag workflow publishes the
+checked artifacts through PyPI Trusted Publishing (OIDC), using
+`Barsoomx/sentry-structlog`, `.github/workflows/publish.yml`, and the GitHub
+environment `pypi`. No PyPI API token is required. The `pypi` environment allows
+deployment only from `v*` tags. Branch pushes, pull requests, and manual workflow
+runs check the build without publishing.
