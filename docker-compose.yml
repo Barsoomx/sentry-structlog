@@ -1,5 +1,10 @@
 services:
-  app:
+  app: &app
     build: .
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - .:/app
+  e2e:
+    <<: *app
+    command: uv run --no-sync pytest -m e2e test/e2e -q
