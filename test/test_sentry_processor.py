@@ -27,6 +27,9 @@ logging.addLevelName(CUSTOM_LOG_LEVEL_VALUE, CUSTOM_LOG_LEVEL_NAME)
 @dataclass
 class ClientParams:
     include_local_variables: bool = True
+    include_source_context: bool = True
+    max_value_length: int = 1024
+    attach_stacktrace: bool = False
     event_scrubber: EventScrubber = field(default_factory=EventScrubber)
 
     @classmethod
@@ -63,6 +66,9 @@ def sentry_events(request):
         integrations=INTEGRATIONS,
         auto_enabling_integrations=False,
         include_local_variables=params.include_local_variables,
+        include_source_context=params.include_source_context,
+        max_value_length=params.max_value_length,
+        attach_stacktrace=params.attach_stacktrace,
         event_scrubber=params.event_scrubber,
     )
 
@@ -327,16 +333,29 @@ def test_sentry_log_failure(sentry_events, level, severity):
         processor(None, None, event_data)
 
     assert_event_dict(event_data, sentry_events, sentry_level=severity)
+    assert "exception" not in sentry_events[0]
+    assert "threads" not in sentry_events[0]
 
 
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"attach_stacktrace": False}, {"attach_stacktrace": True}],
+    indirect=True,
+)
+@pytest.mark.parametrize("stack_info", [False, True])
 @pytest.mark.parametrize("level, severity", [("error", "error"), ("critical", "fatal")])
-def test_sentry_log_failure_exc_info_true(sentry_events, level, severity):
+def test_sentry_log_failure_exc_info_true(sentry_events, level, severity, stack_info):
     """Make sure sentry_sdk.utils.exc_info_from_error doesn't raise ValueError
     Because it can't introspect exc_info.
     Bug triggered when logger.error(..., exc_info=True) or logger.exception(...)
     are used.
     """
-    event_data = {"level": level, "event": level + " message", "exc_info": True}
+    event_data = {
+        "level": level,
+        "event": level + " message",
+        "exc_info": True,
+        "stack_info": stack_info,
+    }
     processor = SentryProcessor(event_level=getattr(logging, level.upper()))
     try:
         1 / 0
@@ -346,6 +365,147 @@ def test_sentry_log_failure_exc_info_true(sentry_events, level, severity):
     assert_event_dict(
         event_data, sentry_events, error=ZeroDivisionError, sentry_level=severity
     )
+    [exception] = sentry_events[0]["exception"]["values"]
+    assert exception["mechanism"] == {"type": "structlog", "handled": True}
+    assert exception["stacktrace"]["frames"][-1]["function"] == (
+        "test_sentry_log_failure_exc_info_true"
+    )
+    assert "threads" not in sentry_events[0]
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"attach_stacktrace": False}, {"attach_stacktrace": True}],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"exc_info": True},
+        {"exc_info": (None, None, None)},
+        {"stack_info": True},
+        {"exc_info": True, "stack_info": True},
+        {"exc_info": False, "stack_info": True},
+    ],
+)
+def test_per_call_stack_without_exception(sentry_events, flags):
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[
+            structlog.stdlib.add_log_level,
+            SentryProcessor(tag_keys="__all__"),
+        ],
+    )
+
+    _, downstream = log.error("stack requested", **flags)
+
+    [event] = sentry_events
+    [thread] = event["threads"]["values"]
+    assert set(thread) == {"stacktrace", "crashed", "current"}
+    assert thread["crashed"] is False
+    assert thread["current"] is True
+    assert any(
+        frame["function"] == "test_per_call_stack_without_exception"
+        for frame in thread["stacktrace"]["frames"]
+    )
+    assert "exception" not in event
+    assert "stacktrace" not in event
+    assert event["tags"] == {}
+    assert {key: downstream[key] for key in flags} == flags
+
+
+@pytest.mark.parametrize("flags", [{}, {"exc_info": False, "stack_info": False}])
+def test_plain_event_has_no_stack(sentry_events, flags):
+    SentryProcessor()(None, "error", {"level": "error", "event": "plain", **flags})
+
+    [event] = sentry_events
+    assert "threads" not in event
+    assert "stacktrace" not in event
+    assert "exception" not in event
+
+
+@pytest.mark.parametrize(
+    "sentry_events, with_locals, with_source",
+    [
+        ({"include_local_variables": True, "include_source_context": True}, True, True),
+        ({"include_local_variables": False}, False, True),
+        ({"include_source_context": False}, True, False),
+    ],
+    indirect=["sentry_events"],
+)
+@pytest.mark.parametrize("flag", ["exc_info", "stack_info"])
+def test_per_call_stack_respects_client_options(
+    sentry_events, with_locals, with_source, flag
+):
+    local_marker = "visible local"
+    SentryProcessor()(None, "error", {"level": "error", "event": "stack", flag: True})
+
+    [event] = sentry_events
+    frames = event["threads"]["values"][0]["stacktrace"]["frames"]
+    [test_frame] = [
+        frame
+        for frame in frames
+        if frame["function"] == "test_per_call_stack_respects_client_options"
+    ]
+    if with_locals:
+        assert local_marker in test_frame["vars"]["local_marker"]
+    else:
+        assert all("vars" not in frame for frame in frames)
+    if with_source:
+        assert "SentryProcessor()" in test_frame["context_line"]
+    else:
+        assert all(
+            key not in frame
+            for frame in frames
+            for key in ("pre_context", "context_line", "post_context")
+        )
+
+
+@pytest.mark.parametrize("sentry_events", [{"max_value_length": 64}], indirect=True)
+@pytest.mark.parametrize("flag", ["exc_info", "stack_info"])
+def test_per_call_stack_respects_max_value_length(sentry_events, flag):
+    SentryProcessor()(None, "error", {"level": "error", "event": "stack", flag: True})
+
+    [event] = sentry_events
+    frames = event["threads"]["values"][0]["stacktrace"]["frames"]
+    [test_frame] = [
+        frame
+        for frame in frames
+        if frame["function"] == "test_per_call_stack_respects_max_value_length"
+    ]
+    assert len(test_frame["context_line"]) <= 64
+    assert test_frame["context_line"].endswith("...")
+
+
+@pytest.mark.parametrize(
+    "sentry_events", [{"max_value_length": 100_000}], indirect=True
+)
+@pytest.mark.parametrize("renderer_first", [False, True])
+def test_stack_info_renderer_order(sentry_events, renderer_first):
+    processors = [
+        SentryProcessor(tag_keys="__all__"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    if renderer_first:
+        processors.reverse()
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[structlog.stdlib.add_log_level, *processors],
+    )
+
+    _, downstream = log.error("rendered stack", stack_info=True)
+
+    [event] = sentry_events
+    assert "test_stack_info_renderer_order" in downstream["stack"]
+    assert "stack_info" not in downstream
+    assert "exception" not in event
+    assert event["tags"] == {}
+    if renderer_first:
+        assert "threads" not in event
+        assert event["contexts"]["structlog"]["stack"] == downstream["stack"]
+    else:
+        assert event["threads"]["values"][0]["stacktrace"]["frames"]
+        assert event["contexts"]["structlog"]["stack_info"] is True
 
 
 absent = object()

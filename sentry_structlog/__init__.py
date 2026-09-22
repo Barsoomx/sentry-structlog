@@ -12,7 +12,11 @@ from uuid import UUID
 
 from sentry_sdk import Scope, get_isolation_scope
 from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
-from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
+from sentry_sdk.utils import (
+    capture_internal_exceptions,
+    current_stacktrace,
+    event_from_exception,
+)
 from structlog.types import EventDict, ExcInfo, WrappedLogger
 
 try:
@@ -186,16 +190,39 @@ class SentryProcessor:
 
         exc_info = _figure_out_exc_info(event_dict.get("exc_info", None))
         has_exc_info = exc_info and exc_info != (None, None, None)
+        client = self._get_scope().get_client()
+        options: dict[str, Any] = client.options if client else {}
 
         if has_exc_info:
-            client = self._get_scope().get_client()
-            options: dict[str, Any] = client.options if client else {}
             event, hint = event_from_exception(
                 exc_info,
                 client_options=options,
+                mechanism={"type": "structlog", "handled": True},
             )
         else:
             event, hint = {}, {}
+            # The SDK client supplies its own stack when attach_stacktrace is set.
+            if (exc_info or event_dict.get("stack_info")) and not options.get(
+                "attach_stacktrace"
+            ):
+                with capture_internal_exceptions():
+                    event["threads"] = {
+                        "values": [
+                            {
+                                "stacktrace": current_stacktrace(
+                                    include_local_variables=options.get(
+                                        "include_local_variables", True
+                                    ),
+                                    include_source_context=options.get(
+                                        "include_source_context", True
+                                    ),
+                                    max_value_length=options.get("max_value_length"),
+                                ),
+                                "crashed": False,
+                                "current": True,
+                            }
+                        ]
+                    }
 
         event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
         event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
