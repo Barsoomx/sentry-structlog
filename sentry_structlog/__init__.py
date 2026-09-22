@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import warnings
 from collections.abc import Iterable, MutableMapping
 from decimal import Decimal
 from enum import Enum
@@ -121,7 +122,8 @@ class SentryProcessor:
         :param ignore_loggers: A list of logger names to ignore any events from.
         :param verbose: Report the action taken by the logger in the `event_dict`.
             Default is :obj:`False`.
-        :param scope: Optionally specify :obj:`sentry_sdk.Scope`.
+        :param scope: Deprecated pinned :obj:`sentry_sdk.Scope`; removed in 4.0.
+            Use the SDK's current or isolation scope instead.
         :param exclude_tag_keys: Additional keys to exclude from tags in either mode.
         :param scrub: Scrub context and drop sensitive tags using the client's event
             scrubber. Default is :obj:`True`. Breadcrumb scrubbing is left to the SDK.
@@ -140,6 +142,14 @@ class SentryProcessor:
         self.scrub = scrub
         self.verbose = verbose
 
+        if scope is not None:
+            warnings.warn(
+                "SentryProcessor(scope=...) is deprecated and will be removed in 4.0. "
+                "Use 'with sentry_sdk.new_scope() as scope: scope.set_client(client)' "
+                "instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._scope = scope
         self._as_context = as_context
         self.ignore_breadcrumb_data = ignore_breadcrumb_data
@@ -174,6 +184,14 @@ class SentryProcessor:
 
     def _get_scope(self) -> Scope:
         return self._scope or get_isolation_scope()
+
+    @staticmethod
+    def _get_hint(event_dict: EventDict) -> dict[str, Any]:
+        hint: dict[str, Any] = {"structlog": dict(event_dict)}
+        record = event_dict.get("_record")
+        if isinstance(record, logging.LogRecord):
+            hint["log_record"] = record
+        return hint
 
     def _get_event_and_hint(
         self, event_dict: EventDict, original_event_dict: EventDict | None = None
@@ -240,6 +258,8 @@ class SentryProcessor:
                 if scrubber is not None and scrubber.recursive
                 else dict(original_event_dict)
             )
+            if isinstance(context.get("_record"), logging.LogRecord):
+                context.pop("_record")
             if scrubber is not None:
                 scrubber.scrub_dict(context)
             event["contexts"] = {"structlog": context}
@@ -262,11 +282,14 @@ class SentryProcessor:
                     tags[key] = tag_value
             event["tags"] = tags
 
-        return event, hint  # type: ignore[return-value]
+        return event, {**hint, **self._get_hint(original_event_dict)}  # type: ignore[return-value]
 
     def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
         data = {
-            k: v for k, v in event_dict.items() if k not in self.ignore_breadcrumb_data
+            k: v
+            for k, v in event_dict.items()
+            if k not in self.ignore_breadcrumb_data
+            and not (k == "_record" and isinstance(v, logging.LogRecord))
         }
         event = {
             "type": "log",
@@ -277,7 +300,7 @@ class SentryProcessor:
             "data": data,
         }
 
-        return event, {"log_record": event_dict}
+        return event, self._get_hint(event_dict)
 
     def _can_record(self, logger: WrappedLogger, event_dict: EventDict) -> bool:
         logger_name = self._get_logger_name(logger=logger, event_dict=event_dict)
