@@ -85,9 +85,10 @@ The `SentryProcessor` class takes the following arguments:
   [breadcrumb data](https://docs.sentry.io/platforms/python/enriching-events/breadcrumbs/#manual-breadcrumbs).
   Defaults to keys which are already sent separately, i.e. `level`, `logger`,
   `event` and `timestamp`. All other data in `event_dict` will be sent as
-  breadcrumb data. Copied into a `frozenset` at construction, so iterators can be
-  used safely across calls and later changes to the source collection have no
-  effect. This option does not exclude keys from contexts or tags.
+  breadcrumb data, except for the callback-only `_record` object. Copied into a
+  `frozenset` at construction, so iterators can be used safely across calls and
+  later changes to the source collection have no effect. This option does not
+  exclude keys from contexts or tags.
 - `tag_keys` Any iterable of keys to send as tags (including lists, tuples, sets,
   and generators), or `"__all__"` for all eligible keys. Defaults to `None` (no
   structlog tags). Any other string raises `ValueError` during construction.
@@ -99,8 +100,34 @@ The `SentryProcessor` class takes the following arguments:
   any events from. Copied into a `frozenset` at construction.
 - `verbose` Report the action taken by the logger in the `event_dict`.
   Default is `False`.
-- `scope` Optionally specify `sentry_sdk.Client` (in upstream `structlog-sentry<2.2`
-  this corresponds to `hub: sentry_sdk.Hub`).
+- `scope` Deprecated optional `sentry_sdk.Scope`. Passing a scope emits
+  `DeprecationWarning`; this parameter will be removed in **4.0**. See
+  [Scopes and thread isolation](#scopes-and-thread-isolation).
+
+### Scopes and thread isolation
+
+Configure shared processors as `SentryProcessor()` without `scope=`. In
+sentry-sdk 2.x, the client attached to a pinned scope is ignored: the SDK selects
+the client from its current, isolation, or global scope. The pinned scope still
+merges its breadcrumbs, tags, and user into every event captured through it,
+including events from other threads.
+
+For a temporary client override, use
+`with sentry_sdk.new_scope() as scope:` followed by `scope.set_client(client)`.
+For separate threads or requests, enter an isolation scope in each worker and
+bind its client there:
+
+```python
+# log uses a shared SentryProcessor() configured without scope=.
+def handle_request(client):
+    with sentry_sdk.isolation_scope() as scope:
+        scope.set_client(client)
+        log.error("request failed")
+```
+
+Record request-specific breadcrumbs, tags, and user inside that isolation scope.
+The processor resolves the active scope on each call. `scope=` remains supported
+with a caller-located deprecation warning until its removal in 4.0.
 
 With `verbose=True`, `sentry="sent"` means the SDK returned an event ID, which is
 also added as `sentry_id`. This indicates SDK acceptance, not guaranteed network
@@ -170,6 +197,45 @@ processor, make that the `SentryProcessor` comes _before_ `format_exc_info`!
 Otherwise, the `SentryProcessor` won't have an `exc_info` to work with, because
 it's removed from the event by `format_exc_info`.
 
+Exception events are marked with `mechanism={"type": "structlog", "handled": True}`.
+When both `exc_info` and `stack_info` are requested and an exception is available,
+the exception's traceback takes priority; no additional thread stack is attached.
+
+To capture the current thread's structured stack without an exception, use:
+
+```python
+log.error("current call site", stack_info=True)
+log.error("current call site", exc_info=True)  # when no exception is active
+```
+
+These calls attach one stack in `threads.values`, with `crashed=False` and
+`current=True`, even when the Sentry client's `attach_stacktrace=False`. Per-call
+stack capture respects the client's `include_local_variables`,
+`include_source_context`, and `max_value_length` options. With
+`attach_stacktrace=True`, the SDK client supplies the stack; the processor does
+not capture another one. Plain events without either flag only get a stack when
+the client's `attach_stacktrace` option is enabled.
+
+Place `SentryProcessor` **before** `structlog.processors.StackInfoRenderer` so it
+can read the raw `stack_info` flag, for example:
+
+```python
+structlog.configure(processors=[
+    structlog.stdlib.add_log_level,
+    SentryProcessor(),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.JSONRenderer(),
+])
+```
+
+`SentryProcessor` leaves `exc_info`, `stack_info`, and `stack` unchanged for
+downstream processors. If `StackInfoRenderer` has already run, it has removed
+`stack_info`: the remaining rendered `stack` string is preserved as context
+(subject to scrubbing and SDK serialization), but is not converted back into a
+structured traceback. Global `attach_stacktrace` still works in that order.
+`stack_info` and `stack` remain reserved keys excluded by `tag_keys="__all__"`.
+
 Logging calls with no `sys.exc_info()` are also automatically captured by Sentry
 either as breadcrumbs (if configured by the `level` argument) or as events:
 
@@ -189,7 +255,28 @@ log.error("error message", sentry_skip=True)
 For captured events, tags, `contexts.structlog`, and breadcrumb data use the same
 snapshot, taken after removing `sentry_skip` and before adding `sentry_id` or
 verbose `sentry` status. Breadcrumb data still respects `ignore_breadcrumb_data`.
-Logs below `event_level` do not allocate this event snapshot.
+Logs below `event_level` do not allocate this event snapshot, but recorded
+breadcrumbs still get a separate callback snapshot.
+
+### Callback hints
+
+Both `before_send(event, hint)` and `before_breadcrumb(breadcrumb, hint)` receive
+`hint["structlog"]`: a shallow copy of the current call's event dict, taken before
+adding `sentry_id` or verbose `sentry` status and after consuming `sentry_skip`.
+Changing its top-level keys does not change data passed to downstream processors
+or the other callback. Nested values are shared; the hint is not scrubbed.
+
+When the event dict contains a real `logging.LogRecord` under `_record`, such as
+with `structlog.stdlib.ProcessorFormatter`, `hint["log_record"]` contains that
+record. Otherwise `log_record` is absent; pure structlog logs no longer put a
+dict under this key. A callback shared with the SDK's `LoggingIntegration` can
+use `hint.get("log_record")` for logger/level filtering and
+`hint.get("structlog")` for structured metadata. Place `SentryProcessor` before
+`ProcessorFormatter.remove_processors_meta` to retain access to `_record`.
+
+Exception events also retain the SDK's `hint["exc_info"]`. Hints are callback
+metadata, not additional event payload fields; a `LogRecord` stored in `_record`
+is excluded from `contexts.structlog` and breadcrumb data.
 
 ### Sentry Tags
 

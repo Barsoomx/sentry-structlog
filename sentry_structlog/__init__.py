@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import warnings
 from collections.abc import Iterable, MutableMapping
 from decimal import Decimal
 from enum import Enum
@@ -12,7 +13,11 @@ from uuid import UUID
 
 from sentry_sdk import Scope, get_isolation_scope
 from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
-from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
+from sentry_sdk.utils import (
+    capture_internal_exceptions,
+    current_stacktrace,
+    event_from_exception,
+)
 from structlog.types import EventDict, ExcInfo, WrappedLogger
 
 try:
@@ -117,7 +122,8 @@ class SentryProcessor:
         :param ignore_loggers: A list of logger names to ignore any events from.
         :param verbose: Report the action taken by the logger in the `event_dict`.
             Default is :obj:`False`.
-        :param scope: Optionally specify :obj:`sentry_sdk.Scope`.
+        :param scope: Deprecated pinned :obj:`sentry_sdk.Scope`; removed in 4.0.
+            Use the SDK's current or isolation scope instead.
         :param exclude_tag_keys: Additional keys to exclude from tags in either mode.
         :param scrub: Scrub context and drop sensitive tags using the client's event
             scrubber. Default is :obj:`True`. Breadcrumb scrubbing is left to the SDK.
@@ -136,6 +142,14 @@ class SentryProcessor:
         self.scrub = scrub
         self.verbose = verbose
 
+        if scope is not None:
+            warnings.warn(
+                "SentryProcessor(scope=...) is deprecated and will be removed in 4.0. "
+                "Use 'with sentry_sdk.new_scope() as scope: scope.set_client(client)' "
+                "instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._scope = scope
         self._as_context = as_context
         self.ignore_breadcrumb_data = frozenset(ignore_breadcrumb_data)
@@ -169,6 +183,14 @@ class SentryProcessor:
     def _get_scope(self) -> Scope:
         return self._scope or get_isolation_scope()
 
+    @staticmethod
+    def _get_hint(event_dict: EventDict) -> dict[str, Any]:
+        hint: dict[str, Any] = {"structlog": dict(event_dict)}
+        record = event_dict.get("_record")
+        if isinstance(record, logging.LogRecord):
+            hint["log_record"] = record
+        return hint
+
     def _get_event_and_hint(
         self, event_dict: EventDict, original_event_dict: EventDict | None = None
     ) -> tuple[dict, dict]:
@@ -184,16 +206,39 @@ class SentryProcessor:
 
         exc_info = _figure_out_exc_info(event_dict.get("exc_info", None))
         has_exc_info = exc_info and exc_info != (None, None, None)
+        client = self._get_scope().get_client()
+        options: dict[str, Any] = client.options if client else {}
 
         if has_exc_info:
-            client = self._get_scope().get_client()
-            options: dict[str, Any] = client.options if client else {}
             event, hint = event_from_exception(
                 exc_info,
                 client_options=options,
+                mechanism={"type": "structlog", "handled": True},
             )
         else:
             event, hint = {}, {}
+            # The SDK client supplies its own stack when attach_stacktrace is set.
+            if (exc_info or event_dict.get("stack_info")) and not options.get(
+                "attach_stacktrace"
+            ):
+                with capture_internal_exceptions():
+                    event["threads"] = {
+                        "values": [
+                            {
+                                "stacktrace": current_stacktrace(
+                                    include_local_variables=options.get(
+                                        "include_local_variables", True
+                                    ),
+                                    include_source_context=options.get(
+                                        "include_source_context", True
+                                    ),
+                                    max_value_length=options.get("max_value_length"),
+                                ),
+                                "crashed": False,
+                                "current": True,
+                            }
+                        ]
+                    }
 
         event["message"] = event_dict.get("event")  # type: ignore[typeddict-item]
         event["level"] = event_dict.get("level")  # type: ignore[typeddict-item]
@@ -211,6 +256,8 @@ class SentryProcessor:
                 if scrubber is not None and scrubber.recursive
                 else dict(original_event_dict)
             )
+            if isinstance(context.get("_record"), logging.LogRecord):
+                context.pop("_record")
             if scrubber is not None:
                 scrubber.scrub_dict(context)
             event["contexts"] = {"structlog": context}
@@ -233,11 +280,14 @@ class SentryProcessor:
                     tags[key] = tag_value
             event["tags"] = tags
 
-        return event, hint  # type: ignore[return-value]
+        return event, {**hint, **self._get_hint(original_event_dict)}  # type: ignore[return-value]
 
     def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
         data = {
-            k: v for k, v in event_dict.items() if k not in self.ignore_breadcrumb_data
+            k: v
+            for k, v in event_dict.items()
+            if k not in self.ignore_breadcrumb_data
+            and not (k == "_record" and isinstance(v, logging.LogRecord))
         }
         event = {
             "type": "log",
@@ -248,7 +298,7 @@ class SentryProcessor:
             "data": data,
         }
 
-        return event, {"log_record": event_dict}
+        return event, self._get_hint(event_dict)
 
     def _can_record(self, logger_name: str | None, event_dict: EventDict) -> bool:
         if logger_name:
