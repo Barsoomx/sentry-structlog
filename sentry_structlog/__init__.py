@@ -322,27 +322,31 @@ class SentryProcessor:
         self, logger: WrappedLogger, name: str, event_dict: EventDict
     ) -> EventDict:
         """A middleware to process structlog `event_dict` and send it to Sentry."""
-        with capture_internal_exceptions():
-            sentry_skip = event_dict.pop("sentry_skip", False)
+        try:
+            with capture_internal_exceptions():
+                sentry_skip = event_dict.pop("sentry_skip", False)
 
-            if self.active and not sentry_skip:
-                level = self._resolve_level(event_dict)
-                if level is None and self.verbose:
-                    event_dict["sentry"] = "skipped"
+                if self.active and not sentry_skip:
+                    level = self._resolve_level(event_dict)
+                    if level is None and self.verbose:
+                        event_dict["sentry"] = "skipped"
 
-                if level is not None and self._can_record(logger, event_dict):
-                    sentry_level = self._get_sentry_level(level)
-                    original_event_dict = event_dict
-                    if level >= self.event_level:
-                        original_event_dict = dict(event_dict)
-                        self._handle_event(
-                            event_dict, original_event_dict, sentry_level
-                        )
+                    if level is not None and self._can_record(logger, event_dict):
+                        sentry_level = self._get_sentry_level(level)
+                        original_event_dict = event_dict
+                        if level >= self.event_level:
+                            original_event_dict = dict(event_dict)
+                            self._handle_event(
+                                event_dict, original_event_dict, sentry_level
+                            )
 
-                    if level >= self.level:
-                        self._handle_breadcrumb(original_event_dict, sentry_level)
+                        if level >= self.level:
+                            self._handle_breadcrumb(original_event_dict, sentry_level)
 
             if self.verbose:
                 event_dict.setdefault("sentry", "skipped")
+        except Exception:
+            # Even a failure in SDK diagnostics must not interrupt application logging.
+            pass
 
         return event_dict
