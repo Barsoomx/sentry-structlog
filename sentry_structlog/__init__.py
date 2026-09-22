@@ -28,7 +28,7 @@ __all__ = ["SentryProcessor", "RESERVED_TAG_KEYS"]
 try:
     from structlog.processors import NAME_TO_LEVEL
 except ImportError:  # Older structlog versions expose the same mapping privately.
-    from structlog.processors import (  # type: ignore[attr-defined,no-redef]
+    from structlog.processors import (  # type: ignore[attr-defined,no-redef] # pyright: ignore[reportAttributeAccessIssue]
         _NAME_TO_LEVEL as NAME_TO_LEVEL,
     )
 
@@ -222,7 +222,8 @@ class SentryProcessor:
                 mechanism={"type": "structlog", "handled": True},
             )
         else:
-            event, hint = {}, {}
+            event = {}
+            hint = {}
             # The SDK client supplies its own stack when attach_stacktrace is set.
             if (exc_info or event_dict.get("stack_info")) and not options.get(
                 "attach_stacktrace"

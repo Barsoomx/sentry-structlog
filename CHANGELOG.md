@@ -8,6 +8,27 @@ For version 2.2.1 and earlier, see the
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-09-23
+
+### Fixed
+
+- Per-call stacks (`stack_info=True`, `exc_info=True` without an active exception)
+  no longer include processor, structlog or logging frames, so raw `event_dict`
+  locals cannot leak secrets through frame variables.
+- Self-referencing or repeated containers in log kwargs no longer raise
+  `RecursionError`; repeats are replaced with a `<cyclic reference>` marker and
+  the event is delivered.
+- The resolved logger name is always used for `event.logger` and breadcrumb
+  `category`; non-string `logger` values are not copied into events.
+
+### Added
+
+- End-to-end canary: the e2e suite also runs an upstream-like processor with a
+  shared snapshot as a strict expected failure.
+- Negative typing checks (`scripts/typing_negative.py`), a Pyright job, and the
+  wheel consumer check on the minimum/latest dependency lanes.
+- Release workflow publishes the artifact that passed the test workflow.
+
 ## [3.0.0] - 2026-09-23
 
 ### Changed
@@ -71,5 +92,6 @@ For version 2.2.1 and earlier, see the
 - Support for Python 3.7–3.9.
 - Poetry and tox configuration; use uv and the documented development commands.
 
-[Unreleased]: https://github.com/Barsoomx/sentry-structlog/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/Barsoomx/sentry-structlog/compare/v3.0.1...HEAD
+[3.0.1]: https://github.com/Barsoomx/sentry-structlog/releases/tag/v3.0.1
 [3.0.0]: https://github.com/Barsoomx/sentry-structlog/releases/tag/v3.0.0
