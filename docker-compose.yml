@@ -1,6 +1,8 @@
 services:
   app: &app
     build: .
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - .:/app
   e2e:
