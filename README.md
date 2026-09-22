@@ -54,7 +54,7 @@ sentry_sdk.init()  # pass dsn in argument or via SENTRY_DSN env variable
 structlog.configure(
     processors=[
         structlog.stdlib.add_logger_name,  # optional, must be placed before SentryProcessor()
-        structlog.stdlib.add_log_level,  # required before SentryProcessor()
+        structlog.stdlib.add_log_level,  # adds the level name before SentryProcessor()
         SentryProcessor(event_level=logging.ERROR),
     ],
     logger_factory=structlog.stdlib.LoggerFactory(),
@@ -65,8 +65,8 @@ structlog.configure(
 log = structlog.get_logger()
 ```
 
-Do not forget to add the `structlog.stdlib.add_log_level` and optionally the
-`structlog.stdlib.add_logger_name` processors before `SentryProcessor`. The
+Add `structlog.stdlib.add_log_level` (or `structlog.stdlib.add_log_level_number`)
+and optionally `structlog.stdlib.add_logger_name` before `SentryProcessor`. The
 `SentryProcessor` class takes the following arguments:
 
 - `level` Events of this or higher levels will be reported as Sentry
@@ -92,6 +92,41 @@ Do not forget to add the `structlog.stdlib.add_log_level` and optionally the
   Default is `False`.
 - `scope` Optionally specify `sentry_sdk.Client` (in upstream `structlog-sentry<2.2`
   this corresponds to `hub: sentry_sdk.Hub`).
+
+### Log levels
+
+Levels are resolved in this order:
+
+1. An integer `level_number`, as supplied by `structlog.stdlib.add_log_level_number`.
+   This takes precedence over `level` and works without a level name.
+2. A case-insensitive name from `structlog.processors.NAME_TO_LEVEL`
+   (`_NAME_TO_LEVEL` on older versions), including `exception` as `error` and
+   `warn` as `warning`.
+3. A name registered with Python logging: first the original spelling, then its
+   uppercase spelling. Only integer lookup results are accepted, so mixed-case
+   custom names such as `logging.addLevelName(25, "LeVeL")` work.
+
+A non-integer `level_number` falls back to the name. Missing or unrecognized
+levels (including `basic_format` and `nonsense`) produce neither an event nor a
+breadcrumb. The original event data is retained, with `sentry="skipped"` added in
+verbose mode. As with other calls, `sentry_skip` is consumed by the processor.
+Errors during processing are contained so application logging can continue.
+
+Both thresholds use the resolved number. Events and breadcrumbs use the same
+Sentry severity mapping, including for custom levels:
+
+| Numeric level | Sentry severity |
+| --- | --- |
+| Below 20 | `debug` |
+| 20–29 | `info` |
+| 30–39 | `warning` |
+| 40–49 | `error` |
+| 50 and above | `fatal` |
+
+The original `level` and `level_number` remain unchanged for downstream
+processors and in `contexts.structlog` (subject to the configured scrubber).
+
+### Capturing events
 
 Now events are automatically captured by Sentry with `log.error()`:
 

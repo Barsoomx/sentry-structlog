@@ -15,6 +15,11 @@ from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
 from structlog.types import EventDict, ExcInfo, WrappedLogger
 
+try:
+    from structlog.processors import NAME_TO_LEVEL
+except ImportError:  # Older structlog versions expose the same mapping privately.
+    from structlog.processors import _NAME_TO_LEVEL as NAME_TO_LEVEL
+
 
 RESERVED_TAG_KEYS = frozenset(
     {
@@ -255,55 +260,89 @@ class SentryProcessor:
         return True
 
     def _handle_event(
-        self, event_dict: EventDict, original_event_dict: EventDict | None = None
+        self,
+        event_dict: EventDict,
+        original_event_dict: EventDict | None = None,
+        sentry_level: str | None = None,
     ) -> None:
         with capture_internal_exceptions():
             event, hint = self._get_event_and_hint(event_dict, original_event_dict)
+            if sentry_level is not None:
+                event["level"] = sentry_level
             sid = self._get_scope().capture_event(event, hint=hint)
             if sid:
                 event_dict["sentry_id"] = sid
             if self.verbose:
                 event_dict["sentry"] = "sent"
 
-    def _handle_breadcrumb(self, event_dict: EventDict) -> None:
+    def _handle_breadcrumb(
+        self, event_dict: EventDict, sentry_level: str | None = None
+    ) -> None:
         with capture_internal_exceptions():
             event, hint = self._get_breadcrumb_and_hint(event_dict)
+            if sentry_level is not None:
+                event["level"] = sentry_level
             self._get_scope().add_breadcrumb(event, hint=hint)
 
     @staticmethod
-    def _get_level_value(level_name: str) -> int:
-        """Get numeric value for the log level name given."""
-        try:
-            # Try to get one of predefined log levels
-            return getattr(logging, level_name)
-        except AttributeError as e:
-            # May be it is a custom log level?
-            level = logging.getLevelName(level_name)
+    def _resolve_level(event_dict: EventDict) -> int | None:
+        """Prefer a numeric level, then structlog aliases and registered names."""
+        level = event_dict.get("level_number")
+        if isinstance(level, int):
+            return level
+
+        name = event_dict.get("level")
+        if not isinstance(name, str):
+            return None
+
+        level = NAME_TO_LEVEL.get(name.lower())
+        if level is not None:
+            return level
+
+        for candidate in (name, name.upper()):
+            level = logging.getLevelName(candidate)
             if isinstance(level, int):
                 return level
+        return None
 
-            # Re-raise original error
-            raise ValueError(f"{level_name} is not a valid log level") from e
+    @staticmethod
+    def _get_sentry_level(level: int) -> str:
+        """Map numeric ranges to Sentry severities, including custom levels."""
+        if level >= logging.CRITICAL:
+            return "fatal"
+        if level >= logging.ERROR:
+            return "error"
+        if level >= logging.WARNING:
+            return "warning"
+        if level >= logging.INFO:
+            return "info"
+        return "debug"
 
     def __call__(
         self, logger: WrappedLogger, name: str, event_dict: EventDict
     ) -> EventDict:
         """A middleware to process structlog `event_dict` and send it to Sentry."""
-        sentry_skip = event_dict.pop("sentry_skip", False)
+        with capture_internal_exceptions():
+            sentry_skip = event_dict.pop("sentry_skip", False)
 
-        if self.active and not sentry_skip:
-            level = self._get_level_value(event_dict["level"].upper())
+            if self.active and not sentry_skip:
+                level = self._resolve_level(event_dict)
+                if level is None and self.verbose:
+                    event_dict["sentry"] = "skipped"
 
-            if self._can_record(logger, event_dict):
-                original_event_dict = event_dict
-                if level >= self.event_level:
-                    original_event_dict = dict(event_dict)
-                    self._handle_event(event_dict, original_event_dict)
+                if level is not None and self._can_record(logger, event_dict):
+                    sentry_level = self._get_sentry_level(level)
+                    original_event_dict = event_dict
+                    if level >= self.event_level:
+                        original_event_dict = dict(event_dict)
+                        self._handle_event(
+                            event_dict, original_event_dict, sentry_level
+                        )
 
-                if level >= self.level:
-                    self._handle_breadcrumb(original_event_dict)
+                    if level >= self.level:
+                        self._handle_breadcrumb(original_event_dict, sentry_level)
 
-        if self.verbose:
-            event_dict.setdefault("sentry", "skipped")
+            if self.verbose:
+                event_dict.setdefault("sentry", "skipped")
 
         return event_dict
