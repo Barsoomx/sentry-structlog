@@ -1,15 +1,57 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from decimal import Decimal
+from enum import Enum
 from fnmatch import fnmatch
 from typing import Any, Optional
 from collections.abc import MutableMapping, Iterable
+from uuid import UUID
 
 from sentry_sdk import Scope, get_isolation_scope
 from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
 from structlog.types import EventDict, ExcInfo, WrappedLogger
+
+
+RESERVED_TAG_KEYS = frozenset(
+    {
+        "event",
+        "level",
+        "logger",
+        "timestamp",
+        "exc_info",
+        "exception",
+        "stack",
+        "stack_info",
+        "sentry_skip",
+        "sentry",
+        "sentry_id",
+        "_record",
+        "_from_structlog",
+    }
+)
+_TAG_KEY_PATTERN = re.compile(r"[a-zA-Z0-9_.:-]{1,32}")
+
+
+def _to_tag_value(value: Any) -> str | None:
+    if not isinstance(value, (str, int, float, bool, UUID, Decimal, Enum)):
+        return None
+    value = str(value)
+    if len(value) > 200 or "\n" in value:
+        return None
+    return value
+
+
+def _copy_scrub_data(value: Any) -> Any:
+    """Copy containers the scrubber mutates, leaving opaque log values untouched."""
+    if isinstance(value, dict):
+        return {key: _copy_scrub_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_scrub_data(item) for item in value]
+    return value
 
 
 def _figure_out_exc_info(v: Any) -> ExcInfo:
@@ -45,10 +87,12 @@ class SentryProcessor:
             "event",
             "timestamp",
         ),
-        tag_keys: list[str] | str | None = None,
+        tag_keys: Iterable[str] | str | None = None,
         ignore_loggers: Iterable[str] | None = None,
         verbose: bool = False,
         scope: Scope | None = None,
+        exclude_tag_keys: Iterable[str] = (),
+        scrub: bool = True,
     ) -> None:
         """
         :param level: Events of this or higher levels will be reported as
@@ -60,18 +104,28 @@ class SentryProcessor:
             Default is :obj:`True`.
         :param ignore_breadcrumb_data: A list of data keys that will be excluded from
             breadcrumb data. Defaults to keys which are already sent separately.
-        :param tag_keys: A list of keys. If any if these keys appear in `event_dict`,
-            the key and its corresponding value in `event_dict` will be used as Sentry
-            event tags. use `"__all__"` to report all key/value pairs of event as tags.
+        :param tag_keys: An iterable of keys to send as tags, or `"__all__"` for all
+            non-reserved keys. Only scalar values and valid Sentry keys are sent.
+            Any other string raises :obj:`ValueError`.
         :param ignore_loggers: A list of logger names to ignore any events from.
         :param verbose: Report the action taken by the logger in the `event_dict`.
             Default is :obj:`False`.
         :param scope: Optionally specify :obj:`sentry_sdk.Scope`.
+        :param exclude_tag_keys: Additional keys to exclude from tags in either mode.
+        :param scrub: Scrub context and drop sensitive tags using the client's event
+            scrubber. Default is :obj:`True`. Breadcrumb scrubbing is left to the SDK.
         """
         self.event_level = event_level
         self.level = level
         self.active = active
-        self.tag_keys = tag_keys
+        if isinstance(tag_keys, str):
+            if tag_keys != "__all__":
+                raise ValueError('tag_keys must be "__all__" or an iterable of keys')
+            self.tag_keys = tag_keys
+        else:
+            self.tag_keys = frozenset(tag_keys) if tag_keys is not None else None
+        self.exclude_tag_keys = frozenset(exclude_tag_keys)
+        self.scrub = scrub
         self.verbose = verbose
 
         self._scope = scope
@@ -115,9 +169,9 @@ class SentryProcessor:
         """Create a sentry event and hint from structlog `event_dict` and sys.exc_info.
 
         :param event_dict: structlog event_dict
-        :param original_event_dict: snapshot of `event_dict` taken before any
-            mutation by this processor; used for tags and context. Defaults to
-            `event_dict` itself.
+        :param original_event_dict: snapshot of `event_dict` taken after removing
+            `sentry_skip`, before capturing the event; used for tags and context.
+            Defaults to `event_dict` itself.
         """
         if original_event_dict is None:
             original_event_dict = event_dict
@@ -140,14 +194,38 @@ class SentryProcessor:
         if "logger" in event_dict:
             event["logger"] = event_dict["logger"]
 
+        scrubber = (
+            self._get_scope().get_client().options.get("event_scrubber")
+            if self.scrub
+            else None
+        )
         if self._as_context:
-            event["contexts"] = {"structlog": dict(original_event_dict)}
-        if self.tag_keys == "__all__":
-            event["tags"] = dict(original_event_dict)
-        if isinstance(self.tag_keys, list):
-            event["tags"] = {
-                key: event_dict[key] for key in self.tag_keys if key in event_dict
-            }
+            context = (
+                _copy_scrub_data(original_event_dict)
+                if scrubber is not None and scrubber.recursive
+                else dict(original_event_dict)
+            )
+            if scrubber is not None:
+                scrubber.scrub_dict(context)
+            event["contexts"] = {"structlog": context}
+        if self.tag_keys is not None:
+            tags = {}
+            for key, value in original_event_dict.items():
+                if self.tag_keys == "__all__":
+                    if key in RESERVED_TAG_KEYS:
+                        continue
+                elif key not in self.tag_keys:
+                    continue
+                if key in self.exclude_tag_keys:
+                    continue
+                if not isinstance(key, str) or not _TAG_KEY_PATTERN.fullmatch(key):
+                    continue
+                if scrubber is not None and key.lower() in scrubber.denylist:
+                    continue
+                tag_value = _to_tag_value(value)
+                if tag_value is not None:
+                    tags[key] = tag_value
+            event["tags"] = tags
 
         return event, hint
 
@@ -211,17 +289,19 @@ class SentryProcessor:
         self, logger: WrappedLogger, name: str, event_dict: EventDict
     ) -> EventDict:
         """A middleware to process structlog `event_dict` and send it to Sentry."""
-        original_event_dict = dict(event_dict)
         sentry_skip = event_dict.pop("sentry_skip", False)
 
-        if self.active and not sentry_skip and self._can_record(logger, event_dict):
+        if self.active and not sentry_skip:
             level = self._get_level_value(event_dict["level"].upper())
 
-            if level >= self.event_level:
-                self._handle_event(event_dict, original_event_dict)
+            if self._can_record(logger, event_dict):
+                original_event_dict = event_dict
+                if level >= self.event_level:
+                    original_event_dict = dict(event_dict)
+                    self._handle_event(event_dict, original_event_dict)
 
-            if level >= self.level:
-                self._handle_breadcrumb(event_dict)
+                if level >= self.level:
+                    self._handle_breadcrumb(original_event_dict)
 
         if self.verbose:
             event_dict.setdefault("sentry", "skipped")
