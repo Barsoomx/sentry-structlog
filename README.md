@@ -435,6 +435,20 @@ checkout, both at runtime and with strict mypy targeting Python 3.10. The consum
 checks processor compatibility, tuple tag keys, exclusions, scrubbing,
 `RESERVED_TAG_KEYS`, and an SDK-typed `before_send` callback using `hint["structlog"]`.
 
+### Docker
+
+Build the development image and run the full test suite:
+
+```sh
+docker compose build
+docker compose run --rm app
+docker compose run --rm app uv run --no-sync ruff check .
+```
+
+The checkout is bind-mounted at `/app`, so source edits are available immediately.
+The image keeps its locked Python environment at `/opt/venv`, separate from any
+host `.venv`. Rebuild the image after changing `pyproject.toml` or `uv.lock`.
+
 ## Contributing
 
 Create a merge request and tag @kiwicom/platform for review.
