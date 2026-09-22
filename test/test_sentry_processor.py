@@ -11,6 +11,7 @@ import sentry_sdk
 import structlog
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.scrubber import EventScrubber
+
 from sentry_structlog import SentryProcessor
 
 INTEGRATIONS = [
