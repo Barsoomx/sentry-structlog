@@ -1,6 +1,7 @@
 import logging
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -75,6 +76,24 @@ def sentry_events(request):
     with sentry_sdk.isolation_scope() as scope:
         scope.set_client(client)
         yield transport.events
+
+
+@pytest.fixture
+def sentry_hints(sentry_events):
+    hints = {"events": [], "breadcrumbs": []}
+
+    def before_send(event, hint):
+        hints["events"].append(hint)
+        return event
+
+    def before_breadcrumb(breadcrumb, hint):
+        hints["breadcrumbs"].append(hint)
+        return breadcrumb
+
+    client = sentry_sdk.get_client()
+    client.options["before_send"] = before_send
+    client.options["before_breadcrumb"] = before_breadcrumb
+    return hints
 
 
 def assert_event_dict(
@@ -246,7 +265,8 @@ def test_numeric_severity_for_events_and_breadcrumbs(mocker, numeric_level, seve
     scope = mocker.Mock(spec=sentry_sdk.Scope)
     scope.capture_event.return_value = None
     event_data = {"event": "custom level", "level_number": numeric_level}
-    processor = SentryProcessor(level=-1, event_level=-1, scope=scope, scrub=False)
+    processor = SentryProcessor(level=-1, event_level=-1, scrub=False)
+    mocker.patch.object(processor, "_get_scope", return_value=scope)
 
     assert processor(None, None, event_data) is event_data
     scope.capture_event.assert_called_once()
@@ -280,7 +300,8 @@ def test_processor_contains_errors_before_capture(mocker, failure_source, verbos
             raise RuntimeError("logger name failed")
 
     scope = mocker.Mock(spec=sentry_sdk.Scope)
-    processor = SentryProcessor(scope=scope, verbose=verbose)
+    processor = SentryProcessor(verbose=verbose)
+    mocker.patch.object(processor, "_get_scope", return_value=scope)
     event_data = {"event": "original", "level": "error"}
     logger = None
     if failure_source == "level_lookup":
@@ -745,6 +766,144 @@ def test_breadcrumbs_with_no_additional_data(sentry_events):
     }
 
 
+@pytest.mark.parametrize("level", ["info", "error"])
+def test_callbacks_receive_structlog_snapshot(sentry_events, sentry_hints, level):
+    original = {"level": level, "event": "message", "request_id": "own"}
+    event_data = {**original, "sentry_skip": False}
+
+    assert SentryProcessor(verbose=True)(None, level, event_data) is event_data
+
+    assert len(sentry_hints["events"]) == (level == "error")
+    [breadcrumb_hint] = sentry_hints["breadcrumbs"]
+    for hint in [*sentry_hints["events"], breadcrumb_hint]:
+        assert "log_record" not in hint
+        assert hint["structlog"] == original
+        assert hint["structlog"] is not event_data
+    if level == "error":
+        [event_hint] = sentry_hints["events"]
+        assert event_hint["structlog"] is not breadcrumb_hint["structlog"]
+
+
+@pytest.mark.parametrize("level", ["info", "error"])
+def test_callback_snapshot_mutation_does_not_change_log_data(sentry_events, level):
+    received = []
+
+    def mutate_snapshot(item, hint):
+        snapshot = hint.get("structlog", {})
+        received.append(dict(snapshot))
+        snapshot["request_id"] = "changed"
+        snapshot.pop("event", None)
+        return item
+
+    client = sentry_sdk.get_client()
+    client.options["before_send"] = mutate_snapshot
+    client.options["before_breadcrumb"] = mutate_snapshot
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[
+            structlog.stdlib.add_log_level,
+            SentryProcessor(tag_keys="__all__"),
+        ],
+    )
+
+    _, downstream = getattr(log, level)("original", request_id="own")
+
+    original = {"level": level, "event": "original", "request_id": "own"}
+    assert received == [original] * (2 if level == "error" else 1)
+    assert downstream["event"] == "original"
+    assert downstream["request_id"] == "own"
+    client.options["before_send"] = None
+    sentry_sdk.capture_message("flush")
+    [breadcrumb] = sentry_events[-1]["breadcrumbs"]["values"]
+    assert breadcrumb["message"] == "original"
+    assert breadcrumb["data"] == {"request_id": "own"}
+    if level == "error":
+        assert sentry_events[0]["contexts"]["structlog"] == original
+        assert sentry_events[0]["tags"] == {"request_id": "own"}
+
+
+@pytest.mark.parametrize("record", [None, {"name": "not a log record"}, "invalid"])
+def test_callbacks_do_not_expose_invalid_log_record(sentry_hints, record):
+    event_data = {"level": "error", "event": "message", "_record": record}
+    SentryProcessor()(None, "error", event_data)
+
+    for hints in sentry_hints.values():
+        [hint] = hints
+        assert "log_record" not in hint
+        assert hint["structlog"]["_record"] is record
+
+
+@pytest.mark.parametrize("logger_name", ["allowed", "filtered"])
+@pytest.mark.parametrize("level", [logging.WARNING, logging.ERROR])
+def test_processor_formatter_hints_support_log_record_filtering(
+    sentry_events, logger_name, level
+):
+    received = []
+
+    def filter_log(item, hint):
+        received.append(hint)
+        record = hint["log_record"]
+        if record.name == "filtered" and record.levelno < logging.ERROR:
+            return None
+        return item
+
+    client = sentry_sdk.get_client()
+    client.options["before_send"] = filter_log
+    client.options["before_breadcrumb"] = filter_log
+    formatter = structlog.stdlib.ProcessorFormatter(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            SentryProcessor(),
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+    record = logging.LogRecord(logger_name, level, __file__, 1, "message", (), None)
+
+    formatter.format(record)
+
+    assert len(received) == 2
+    for hint in received:
+        assert isinstance(hint["log_record"], logging.LogRecord)
+        assert hint["log_record"].name == logger_name
+        assert hint["log_record"].levelno == level
+        assert hint["structlog"]["_record"] is hint["log_record"]
+        assert hint["structlog"]["event"] == "message"
+    kept = logger_name != "filtered" or level >= logging.ERROR
+    assert len(sentry_events) == int(kept)
+    if kept:
+        assert "_record" not in sentry_events[0]["contexts"]["structlog"]
+    client.options["before_send"] = None
+    sentry_sdk.capture_message("flush")
+    breadcrumbs = sentry_events[-1].get("breadcrumbs", {}).get("values", [])
+    assert len(breadcrumbs) == int(kept)
+    if kept:
+        assert "_record" not in breadcrumbs[0]["data"]
+
+
+def test_before_send_hint_preserves_exc_info(sentry_events, sentry_hints):
+    try:
+        raise ValueError("failure")
+    except ValueError:
+        exc_info = sys.exc_info()
+        event_data = {
+            "level": "error",
+            "event": "failed",
+            "exc_info": exc_info,
+            "request_id": "own",
+        }
+        SentryProcessor()(None, "error", event_data)
+
+    [hint] = sentry_hints["events"]
+    assert hint["exc_info"] == exc_info
+    assert hint["structlog"]["exc_info"] is exc_info
+    assert hint["structlog"]["request_id"] == "own"
+    assert "log_record" not in hint
+    [event] = sentry_events
+    assert event["exception"]["values"][0]["type"] == "ValueError"
+
+
 @pytest.mark.parametrize("tag_keys", ["__all__", ["sentry_skip", "request_id"]])
 def test_sentry_skip_false_is_not_event_data(sentry_events, tag_keys):
     processor = SentryProcessor(tag_keys=tag_keys)
@@ -800,7 +959,6 @@ def test_downstream_mutation_does_not_change_event_or_breadcrumb(
 @pytest.mark.parametrize(
     "options, event_data",
     [
-        ({}, {"level": "info", "event": "breadcrumb only"}),
         ({"active": False}, {"level": "error", "event": "disabled"}),
         ({}, {"level": "error", "event": "skipped", "sentry_skip": True}),
         (
@@ -809,7 +967,7 @@ def test_downstream_mutation_does_not_change_event_or_breadcrumb(
         ),
     ],
 )
-def test_no_event_snapshot_without_capture(sentry_events, mocker, options, event_data):
+def test_no_snapshot_for_unrecorded_logs(sentry_events, mocker, options, event_data):
     copy_dict = mocker.patch("sentry_structlog.dict", wraps=dict, create=True)
     SentryProcessor(**options)(None, None, event_data)
 
@@ -1104,7 +1262,24 @@ class PausingSentryProcessor(SentryProcessor):
         return super()._can_record(logger, event_dict)
 
 
-def test_tags_and_context_are_not_shared_between_threads(sentry_events):
+def test_scope_parameter_warns_at_caller(sentry_events):
+    scope = sentry_sdk.Scope()
+    scope.set_tag("pinned", "retained")
+    with pytest.warns(DeprecationWarning, match=r"scope=.*removed in 4\.0") as caught:
+        caller_line = sys._getframe().f_lineno + 1
+        processor = SentryProcessor(scope=scope)
+
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+    assert caught[0].lineno == caller_line
+    assert "with sentry_sdk.new_scope()" in str(caught[0].message)
+    assert "set_client" in str(caught[0].message)
+    processor(None, "error", {"level": "error", "event": "still supported"})
+    [event] = sentry_events
+    assert event["tags"]["pinned"] == "retained"
+
+
+def test_tags_and_context_are_not_shared_between_threads():
     paused, resume = threading.Event(), threading.Event()
     processor = PausingSentryProcessor(
         paused,
@@ -1112,18 +1287,67 @@ def test_tags_and_context_are_not_shared_between_threads(sentry_events):
         pause_on="own error",
         event_level=logging.ERROR,
         tag_keys="__all__",
-        scope=sentry_sdk.get_isolation_scope(),
     )
     own = {"level": "error", "event": "own error", "request_id": "own"}
     foreign = {"level": "info", "event": "request_finished", "request_id": "foreign"}
 
-    worker = threading.Thread(target=processor, args=(None, None, dict(own)))
-    worker.start()
-    assert paused.wait(5)
-    processor(None, None, dict(foreign))
-    resume.set()
-    worker.join(5)
+    def run(event_data):
+        transport = CaptureTransport()
+        client = sentry_sdk.Client(
+            transport=transport,
+            integrations=INTEGRATIONS,
+            auto_enabling_integrations=False,
+        )
+        with sentry_sdk.isolation_scope() as scope:
+            scope.set_client(client)
+            processor(None, None, dict(event_data))
+        return transport.events
 
-    [event] = sentry_events
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        own_result = executor.submit(run, own)
+        try:
+            assert paused.wait(5)
+            assert executor.submit(run, foreign).result(timeout=5) == []
+        finally:
+            resume.set()
+        [event] = own_result.result(timeout=5)
+
     assert event["tags"] == {"request_id": "own"}
     assert event["contexts"]["structlog"] == own
+
+
+def test_breadcrumbs_and_user_are_not_shared_between_threads():
+    processor = SentryProcessor()
+    breadcrumbs_recorded = threading.Barrier(2)
+
+    def run(name):
+        transport = CaptureTransport()
+        client = sentry_sdk.Client(
+            transport=transport,
+            integrations=INTEGRATIONS,
+            auto_enabling_integrations=False,
+        )
+        with sentry_sdk.isolation_scope() as scope:
+            scope.set_client(client)
+            scope.set_tag("request_id", name)
+            if name == "own":
+                scope.set_user({"id": "own-user"})
+            processor(None, "info", {"level": "info", "event": f"{name} breadcrumb"})
+            breadcrumbs_recorded.wait(timeout=5)
+            processor(None, "error", {"level": "error", "event": f"{name} error"})
+        return transport.events
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = {name: executor.submit(run, name) for name in ("own", "foreign")}
+        events = {name: result.result(timeout=5) for name, result in results.items()}
+
+    for name, captured in events.items():
+        [event] = captured
+        assert event["message"] == f"{name} error"
+        assert event["tags"]["request_id"] == name
+        [breadcrumb] = event["breadcrumbs"]["values"]
+        assert breadcrumb["message"] == f"{name} breadcrumb"
+        if name == "own":
+            assert event["user"] == {"id": "own-user"}
+        else:
+            assert not event.get("user")
