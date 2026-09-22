@@ -1,10 +1,16 @@
 import logging
+import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum
+from uuid import UUID
 
 import pytest
 import sentry_sdk
+import structlog
 from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.scrubber import EventScrubber
 
 from sentry_structlog import SentryProcessor
 
@@ -13,7 +19,7 @@ INTEGRATIONS = [
 ]
 
 # Register custom log level
-CUSTOM_LOG_LEVEL_NAME = "CUSTOM_LEVEL"
+CUSTOM_LOG_LEVEL_NAME = "CuStOm_LeVeL"
 CUSTOM_LOG_LEVEL_VALUE = logging.DEBUG
 logging.addLevelName(CUSTOM_LOG_LEVEL_VALUE, CUSTOM_LOG_LEVEL_NAME)
 
@@ -21,6 +27,7 @@ logging.addLevelName(CUSTOM_LOG_LEVEL_VALUE, CUSTOM_LOG_LEVEL_NAME)
 @dataclass
 class ClientParams:
     include_local_variables: bool = True
+    event_scrubber: EventScrubber = field(default_factory=EventScrubber)
 
     @classmethod
     def from_request(cls, request):
@@ -56,6 +63,7 @@ def sentry_events(request):
         integrations=INTEGRATIONS,
         auto_enabling_integrations=False,
         include_local_variables=params.include_local_variables,
+        event_scrubber=params.event_scrubber,
     )
 
     with sentry_sdk.isolation_scope() as scope:
@@ -63,9 +71,11 @@ def sentry_events(request):
         yield transport.events
 
 
-def assert_event_dict(event_data, sentry_events, number_of_events=1, error=None):
+def assert_event_dict(
+    event_data, sentry_events, number_of_events=1, error=None, sentry_level=None
+):
     assert len(sentry_events) == number_of_events
-    assert event_data["level"] == sentry_events[0]["level"]
+    assert (sentry_level or event_data["level"]) == sentry_events[0]["level"]
     assert event_data["event"] == sentry_events[0]["message"]
 
     if error is not None:
@@ -96,21 +106,202 @@ def test_sentry_sent():
 
 
 @pytest.mark.parametrize(
-    "level, level_value",
+    "level, level_value, sentry_level",
     [
-        (CUSTOM_LOG_LEVEL_NAME, CUSTOM_LOG_LEVEL_VALUE),
-        ("debug", logging.DEBUG),
-        ("info", logging.INFO),
-        ("warning", logging.WARNING),
+        (CUSTOM_LOG_LEVEL_NAME, CUSTOM_LOG_LEVEL_VALUE, "debug"),
+        ("debug", logging.DEBUG, "debug"),
+        ("info", logging.INFO, "info"),
+        ("warning", logging.WARNING, "warning"),
     ],
 )
-def test_sentry_log(sentry_events, level, level_value):
+def test_sentry_log(sentry_events, level, level_value, sentry_level):
     event_data = {"level": level, "event": level + " message"}
 
     processor = SentryProcessor(event_level=level_value)
     processor(None, None, event_data)
 
-    assert_event_dict(event_data, sentry_events)
+    assert_event_dict(event_data, sentry_events, sentry_level=sentry_level)
+
+
+@pytest.fixture
+def custom_level_names(monkeypatch):
+    monkeypatch.setattr(logging, "_nameToLevel", logging._nameToLevel.copy())
+    monkeypatch.setattr(logging, "_levelToName", logging._levelToName.copy())
+    logging.addLevelName(25, "LeVeL")
+    logging.addLevelName(25, "NOTICE")
+    # Standard structlog names take precedence over logging registrations.
+    logging.addLevelName(45, "WARNING")
+
+
+@pytest.mark.usefixtures("custom_level_names")
+@pytest.mark.parametrize("threshold_offset", [0, 1])
+@pytest.mark.parametrize(
+    "level_fields, numeric_level, severity",
+    [
+        ({"level": CUSTOM_LOG_LEVEL_NAME}, CUSTOM_LOG_LEVEL_VALUE, "debug"),
+        ({"level": "LeVeL"}, 25, "info"),
+        ({"level": "NOTICE"}, 25, "info"),
+        ({"level": "notice"}, 25, "info"),
+        ({"level": "exception"}, 40, "error"),
+        ({"level": "ExCePtIoN"}, 40, "error"),
+        ({"level": "warn"}, 30, "warning"),
+        ({"level": "warning"}, 30, "warning"),
+        ({"level": "WARNING"}, 30, "warning"),
+        ({"level": "critical"}, 50, "fatal"),
+        ({"level": "fatal"}, 50, "fatal"),
+        ({"level": "nonsense", "level_number": 40}, 40, "error"),
+        ({"level": "debug", "level_number": 40}, 40, "error"),
+        ({"level": "error", "level_number": 10}, 10, "debug"),
+        ({"level_number": 25}, 25, "info"),
+        ({"level": "basic_format", "level_number": 30}, 30, "warning"),
+        ({"level": None, "level_number": 40}, 40, "error"),
+        ({"level": "warning", "level_number": "40"}, 30, "warning"),
+        ({"level": "warning", "level_number": 40.0}, 30, "warning"),
+    ],
+)
+def test_level_resolution_filters_and_normalizes_payloads(
+    sentry_events, level_fields, numeric_level, severity, threshold_offset
+):
+    original = {"event": "first", **level_fields}
+    event_data = original.copy()
+    threshold = numeric_level + threshold_offset
+    processor = SentryProcessor(level=threshold, event_level=threshold)
+
+    assert processor(None, None, event_data) is event_data
+    assert {
+        key: value for key, value in event_data.items() if key != "sentry_id"
+    } == original
+    if threshold_offset:
+        assert not sentry_events
+    else:
+        [event] = sentry_events
+        assert event["level"] == severity
+        assert event["contexts"]["structlog"] == original
+
+    # A subsequent event exposes any breadcrumb left by the first call.
+    SentryProcessor()(None, None, {"level": "error", "event": "second"})
+    breadcrumbs = sentry_events[-1].get("breadcrumbs", {}).get("values", [])
+    if threshold_offset:
+        assert breadcrumbs == []
+    else:
+        [breadcrumb] = breadcrumbs
+        assert breadcrumb["level"] == severity
+        assert breadcrumb["message"] == "first"
+        assert breadcrumb["data"] == {
+            key: value for key, value in level_fields.items() if key != "level"
+        }
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize(
+    "level_fields",
+    [
+        {},
+        {"level": "basic_format"},
+        {"level": "nonsense"},
+        {"level": "nonsense", "sentry": "sent"},
+        {"level": None},
+        {"level": 40},
+        {"level": []},
+        {"level_number": "40"},
+        {"level_number": 40.0},
+    ],
+)
+def test_unresolved_levels_are_skipped(sentry_events, level_fields, verbose):
+    original = {"event": "unresolved", "context": {"value": 1}, **level_fields}
+    event_data = original.copy()
+    processor = SentryProcessor(level=0, event_level=0, verbose=verbose)
+
+    assert processor(None, "error", event_data) is event_data
+    assert event_data == {**original, **({"sentry": "skipped"} if verbose else {})}
+    assert not sentry_events
+
+    SentryProcessor()(None, None, {"level": "error", "event": "second"})
+    assert not sentry_events[0].get("breadcrumbs", {}).get("values", [])
+
+
+@pytest.mark.parametrize(
+    "numeric_level, severity",
+    [
+        (-1, "debug"),
+        (0, "debug"),
+        (19, "debug"),
+        (20, "info"),
+        (29, "info"),
+        (30, "warning"),
+        (39, "warning"),
+        (40, "error"),
+        (49, "error"),
+        (50, "fatal"),
+        (60, "fatal"),
+    ],
+)
+def test_numeric_severity_for_events_and_breadcrumbs(mocker, numeric_level, severity):
+    scope = mocker.Mock(spec=sentry_sdk.Scope)
+    scope.capture_event.return_value = None
+    event_data = {"event": "custom level", "level_number": numeric_level}
+    processor = SentryProcessor(level=-1, event_level=-1, scope=scope, scrub=False)
+
+    assert processor(None, None, event_data) is event_data
+    scope.capture_event.assert_called_once()
+    scope.add_breadcrumb.assert_called_once()
+    assert scope.capture_event.call_args.args[0]["level"] == severity
+    assert scope.add_breadcrumb.call_args.args[0]["level"] == severity
+
+
+def test_structlog_add_log_level_number_without_name(sentry_events):
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[structlog.stdlib.add_log_level_number, SentryProcessor()],
+    )
+
+    log.error("numeric level")
+
+    [event] = sentry_events
+    assert event["level"] == "error"
+    assert event["contexts"]["structlog"] == {
+        "event": "numeric level",
+        "level_number": logging.ERROR,
+    }
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("failure_source", ["level_lookup", "logger_name", "threshold"])
+def test_processor_contains_errors_before_capture(mocker, failure_source, verbose):
+    class BrokenLogger:
+        @property
+        def name(self):
+            raise RuntimeError("logger name failed")
+
+    scope = mocker.Mock(spec=sentry_sdk.Scope)
+    processor = SentryProcessor(scope=scope, verbose=verbose)
+    event_data = {"event": "original", "level": "error"}
+    logger = None
+    if failure_source == "level_lookup":
+        event_data["level"] = "custom"
+        mocker.patch("logging.getLevelName", side_effect=RuntimeError("lookup failed"))
+    elif failure_source == "logger_name":
+        logger = BrokenLogger()
+    else:
+        processor.event_level = None
+    original = event_data.copy()
+
+    assert processor(logger, None, event_data) is event_data
+    assert event_data == {**original, **({"sentry": "skipped"} if verbose else {})}
+    scope.capture_event.assert_not_called()
+    scope.add_breadcrumb.assert_not_called()
+
+
+def test_processor_contains_sdk_diagnostic_errors(mocker):
+    mocker.patch("logging.getLevelName", side_effect=RuntimeError("lookup failed"))
+    mocker.patch(
+        "sentry_sdk.utils.capture_internal_exception",
+        side_effect=RuntimeError("diagnostic failed"),
+    )
+    event_data = {"event": "original", "level": "custom"}
+
+    assert SentryProcessor()(None, None, event_data) is event_data
+    assert event_data == {"event": "original", "level": "custom"}
 
 
 @pytest.mark.parametrize("level", ["debug", "info", "warning"])
@@ -123,8 +314,8 @@ def test_sentry_log_only_errors(sentry_events, level):
     assert event_dict["sentry"] == "skipped"
 
 
-@pytest.mark.parametrize("level", ["error", "critical"])
-def test_sentry_log_failure(sentry_events, level):
+@pytest.mark.parametrize("level, severity", [("error", "error"), ("critical", "fatal")])
+def test_sentry_log_failure(sentry_events, level, severity):
     """Make sure that events without exc_info=True will have no
     'exception' information after processing
     """
@@ -135,11 +326,11 @@ def test_sentry_log_failure(sentry_events, level):
     except ZeroDivisionError:
         processor(None, None, event_data)
 
-    assert_event_dict(event_data, sentry_events)
+    assert_event_dict(event_data, sentry_events, sentry_level=severity)
 
 
-@pytest.mark.parametrize("level", ["error", "critical"])
-def test_sentry_log_failure_exc_info_true(sentry_events, level):
+@pytest.mark.parametrize("level, severity", [("error", "error"), ("critical", "fatal")])
+def test_sentry_log_failure_exc_info_true(sentry_events, level, severity):
     """Make sure sentry_sdk.utils.exc_info_from_error doesn't raise ValueError
     Because it can't introspect exc_info.
     Bug triggered when logger.error(..., exc_info=True) or logger.exception(...)
@@ -152,7 +343,9 @@ def test_sentry_log_failure_exc_info_true(sentry_events, level):
     except ZeroDivisionError:
         processor(None, None, event_data)
 
-    assert_event_dict(event_data, sentry_events, error=ZeroDivisionError)
+    assert_event_dict(
+        event_data, sentry_events, error=ZeroDivisionError, sentry_level=severity
+    )
 
 
 absent = object()
@@ -201,8 +394,7 @@ def test_sentry_log_all_as_tags(sentry_events, level):
     processor(None, None, event_data)
 
     assert_event_dict(event_data, sentry_events)
-    assert event_data["level"] == sentry_events[0]["tags"]["level"]
-    assert event_data["event"] == sentry_events[0]["tags"]["event"]
+    assert sentry_events[0]["tags"] == {}
     assert event_data["level"] == sentry_events[0]["contexts"]["structlog"]["level"]
     assert event_data["event"] == sentry_events[0]["contexts"]["structlog"]["event"]
 
@@ -223,7 +415,7 @@ def test_sentry_log_specific_keys_as_tags(sentry_events, level):
 
     assert_event_dict(event_data, sentry_events)
     assert sentry_events[0]["tags"] == {
-        k: event_data[k] for k in tag_keys if k in event_data
+        k: str(event_data[k]) for k in tag_keys if k in event_data
     }
 
 
@@ -261,8 +453,17 @@ def test_sentry_get_logger_name():
     )
 
 
-@pytest.mark.parametrize("level", ["debug", "info", "warning", "error", "critical"])
-def test_sentry_ignore_logger(sentry_events, level):
+@pytest.mark.parametrize(
+    "level, severity",
+    [
+        ("debug", "debug"),
+        ("info", "info"),
+        ("warning", "warning"),
+        ("error", "error"),
+        ("critical", "fatal"),
+    ],
+)
+def test_sentry_ignore_logger(sentry_events, level, severity):
     blacklisted_logger = MockLogger("test.blacklisted")
     whitelisted_logger = MockLogger("test.whitelisted")
     processor = SentryProcessor(
@@ -280,7 +481,7 @@ def test_sentry_ignore_logger(sentry_events, level):
         whitelisted_logger, None, event_data.copy()
     )
 
-    assert_event_dict(event_data, sentry_events)
+    assert_event_dict(event_data, sentry_events, sentry_level=severity)
     assert blacklisted_logger_event_dict.get("sentry") == "ignored"
     assert whitelisted_logger_event_dict.get("sentry") != "ignored"
 
@@ -384,6 +585,351 @@ def test_breadcrumbs_with_no_additional_data(sentry_events):
     }
 
 
+@pytest.mark.parametrize("tag_keys", ["__all__", ["sentry_skip", "request_id"]])
+def test_sentry_skip_false_is_not_event_data(sentry_events, tag_keys):
+    processor = SentryProcessor(tag_keys=tag_keys)
+    processor(
+        None,
+        None,
+        {"level": "error", "event": "x", "sentry_skip": False, "request_id": "own"},
+    )
+
+    [event] = sentry_events
+    assert "sentry_skip" not in event["tags"]
+    assert "sentry_skip" not in event["contexts"]["structlog"]
+
+
+@pytest.mark.parametrize("tag_keys", ["__all__", ["request_id"]])
+def test_tags_and_context_use_supplied_snapshot(sentry_events, tag_keys):
+    snapshot = {"level": "error", "event": "x", "request_id": "original"}
+    event_data = {**snapshot, "request_id": "changed"}
+    processor = SentryProcessor(tag_keys=tag_keys)
+    processor._handle_event(event_data, snapshot)
+
+    [event] = sentry_events
+    assert event["tags"]["request_id"] == "original"
+    assert event["contexts"]["structlog"]["request_id"] == "original"
+
+
+@pytest.mark.parametrize("tag_keys", ["__all__", ["request_id"]])
+def test_downstream_mutation_does_not_change_event_or_breadcrumb(
+    sentry_events, tag_keys
+):
+    def mutate(logger, method_name, event_dict):
+        event_dict["request_id"] = "changed"
+        return event_dict
+
+    log = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[
+            structlog.stdlib.add_log_level,
+            SentryProcessor(tag_keys=tag_keys, verbose=True),
+            mutate,
+        ],
+    )
+    log.error("first", request_id="original")
+    log.error("second")
+
+    first, second = sentry_events
+    assert first["tags"]["request_id"] == "original"
+    assert first["contexts"]["structlog"]["request_id"] == "original"
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb["data"] == {"request_id": "original"}
+
+
+@pytest.mark.parametrize(
+    "options, event_data",
+    [
+        ({}, {"level": "info", "event": "breadcrumb only"}),
+        ({"active": False}, {"level": "error", "event": "disabled"}),
+        ({}, {"level": "error", "event": "skipped", "sentry_skip": True}),
+        (
+            {"ignore_loggers": ["ignored"]},
+            {"level": "error", "event": "ignored", "logger": "ignored"},
+        ),
+    ],
+)
+def test_no_event_snapshot_without_capture(sentry_events, mocker, options, event_data):
+    copy_dict = mocker.patch("sentry_structlog.dict", wraps=dict, create=True)
+    SentryProcessor(**options)(None, None, event_data)
+
+    assert not sentry_events
+    copy_dict.assert_not_called()
+
+
+class TagStatus(Enum):
+    READY = "ready"
+
+
+@pytest.mark.parametrize("tag_keys", ["__all__", ["candidate"]])
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("text", "text"),
+        ("", ""),
+        (42, "42"),
+        (1.25, "1.25"),
+        (True, "True"),
+        (False, "False"),
+        (
+            UUID("12345678-1234-5678-1234-567812345678"),
+            "12345678-1234-5678-1234-567812345678",
+        ),
+        (Decimal("12.30"), "12.30"),
+        (TagStatus.READY, "TagStatus.READY"),
+        ({"field": "data"}, None),
+        (["data"], None),
+        (None, None),
+        ("x" * 200, "x" * 200),
+        ("x" * 201, None),
+        ("x" * 250, None),
+        ("first\nsecond", None),
+    ],
+)
+def test_tag_value_policy(sentry_events, tag_keys, value, expected):
+    event_data = {"level": "error", "event": "x", "candidate": value}
+    SentryProcessor(tag_keys=tag_keys)(None, None, event_data)
+
+    [event] = sentry_events
+    assert event["tags"] == ({} if expected is None else {"candidate": expected})
+    assert "candidate" in event["contexts"]["structlog"]
+    if value is None or isinstance(value, (str, int, float, dict, list)):
+        assert event["contexts"]["structlog"]["candidate"] == value
+
+
+@pytest.mark.parametrize("all_tags", [True, False])
+@pytest.mark.parametrize(
+    "key, allowed",
+    [
+        ("valid.A_0:b-c", True),
+        ("x" * 32, True),
+        ("x" * 33, False),
+        ("x" * 40, False),
+        ("with space", False),
+        ("", False),
+        ("line\n", False),
+        ("ключ", False),
+    ],
+)
+def test_tag_key_policy(sentry_events, all_tags, key, allowed):
+    tag_keys = "__all__" if all_tags else [key]
+    SentryProcessor(tag_keys=tag_keys)(
+        None, None, {"level": "error", "event": "x", key: "data"}
+    )
+
+    [event] = sentry_events
+    assert event["tags"] == ({key: "data"} if allowed else {})
+    assert event["contexts"]["structlog"][key] == "data"
+
+
+@pytest.mark.parametrize("keys_type", [list, tuple, set, frozenset, iter])
+def test_tag_keys_accept_iterables_for_repeated_events(sentry_events, keys_type):
+    processor = SentryProcessor(tag_keys=keys_type(["request_id", "missing"]))
+    for request_id in ("first", "second"):
+        processor(
+            None, None, {"level": "error", "event": "x", "request_id": request_id}
+        )
+
+    assert [event["tags"] for event in sentry_events] == [
+        {"request_id": "first"},
+        {"request_id": "second"},
+    ]
+
+
+@pytest.mark.parametrize("tag_keys", ["request_id", "", "__ALL__"])
+def test_tag_keys_reject_other_strings(tag_keys):
+    with pytest.raises(ValueError, match="tag_keys"):
+        SentryProcessor(tag_keys=tag_keys)
+
+
+@pytest.mark.parametrize("tag_keys", ["__all__", ("date", "request_id")])
+@pytest.mark.parametrize("keys_type", [tuple, set, iter])
+def test_exclude_tag_keys(sentry_events, tag_keys, keys_type):
+    processor = SentryProcessor(
+        tag_keys=tag_keys, exclude_tag_keys=keys_type(["date", "missing"])
+    )
+    for _ in range(2):
+        processor(
+            None,
+            None,
+            {"level": "error", "event": "x", "date": "today", "request_id": "own"},
+        )
+
+    assert len(sentry_events) == 2
+    for event in sentry_events:
+        assert event["tags"] == {"request_id": "own"}
+        assert event["contexts"]["structlog"]["date"] == "today"
+
+
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        "event",
+        "level",
+        "logger",
+        "timestamp",
+        "exc_info",
+        "exception",
+        "stack",
+        "stack_info",
+        "sentry",
+        "sentry_id",
+        "_record",
+        "_from_structlog",
+    ],
+)
+def test_reserved_keys_stay_in_context_only(sentry_events, reserved_key):
+    event_data = {reserved_key: "metadata", "level": "error", "event": "x"}
+    expected = event_data[reserved_key]
+    SentryProcessor(tag_keys="__all__")(None, None, event_data)
+
+    [event] = sentry_events
+    assert event["tags"] == {}
+    assert event["contexts"]["structlog"][reserved_key] == expected
+
+
+def test_reserved_key_can_be_selected_explicitly(sentry_events):
+    SentryProcessor(tag_keys=("event",))(None, None, {"level": "error", "event": "x"})
+
+    [event] = sentry_events
+    assert event["tags"] == {"event": "x"}
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"event_scrubber": EventScrubber(denylist=["value"], recursive=True)}],
+    indirect=True,
+)
+@pytest.mark.parametrize("options", [{}, {"scrub": True}, {"scrub": False}])
+@pytest.mark.parametrize("tag_keys", ["__all__", ("value", "VALUE", "request_id")])
+def test_scrub_context_and_drop_sensitive_tags(sentry_events, options, tag_keys):
+    event_data = {
+        "level": "error",
+        "event": "x",
+        "value": "secret",
+        "VALUE": "upper secret",
+        "nested": {"value": "s"},
+        "items": [{"value": "list secret"}],
+        "request_id": "own",
+    }
+    SentryProcessor(tag_keys=tag_keys, **options)(None, None, event_data)
+
+    [event] = sentry_events
+    context = event["contexts"]["structlog"]
+    if options.get("scrub", True):
+        assert event["tags"] == {"request_id": "own"}
+        assert context["value"] == context["VALUE"] == "[Filtered]"
+        assert context["nested"]["value"] == "[Filtered]"
+        assert context["items"][0]["value"] == "[Filtered]"
+    else:
+        assert event["tags"] == {
+            "value": "secret",
+            "VALUE": "upper secret",
+            "request_id": "own",
+        }
+        assert context["value"] == "secret"
+        assert context["VALUE"] == "upper secret"
+        assert context["nested"]["value"] == "s"
+        assert context["items"][0]["value"] == "list secret"
+    assert event_data["value"] == "secret"
+    assert event_data["nested"] == {"value": "s"}
+    assert event_data["items"] == [{"value": "list secret"}]
+
+
+@pytest.mark.parametrize("as_context", [True, False])
+def test_default_scrubber_filters_password(sentry_events, as_context):
+    SentryProcessor(tag_keys="__all__", as_context=as_context)(
+        None, None, {"level": "error", "event": "x", "password": "secret"}
+    )
+
+    [event] = sentry_events
+    assert "password" not in event["tags"]
+    if as_context:
+        assert event["contexts"]["structlog"]["password"] == "[Filtered]"
+    else:
+        assert "structlog" not in event.get("contexts", {})
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"event_scrubber": EventScrubber(denylist=["value"], recursive=False)}],
+    indirect=True,
+)
+def test_scrubbing_respects_nonrecursive_client_setting(sentry_events):
+    SentryProcessor(tag_keys="__all__")(
+        None,
+        None,
+        {"level": "error", "event": "x", "value": "secret", "nested": {"value": "s"}},
+    )
+
+    [event] = sentry_events
+    assert event["tags"] == {}
+    assert event["contexts"]["structlog"]["value"] == "[Filtered]"
+    assert event["contexts"]["structlog"]["nested"] == {"value": "s"}
+
+
+def test_capture_without_client_scrubber(sentry_events, monkeypatch):
+    client = sentry_sdk.get_client()
+    monkeypatch.setitem(client.options, "event_scrubber", None)
+    SentryProcessor(tag_keys="__all__")(
+        None, None, {"level": "error", "event": "x", "password": "secret"}
+    )
+
+    [event] = sentry_events
+    assert event["tags"] == {"password": "secret"}
+    assert event["contexts"]["structlog"]["password"] == "secret"
+
+
+def test_build_event_without_scrubber_option(sentry_events, monkeypatch):
+    # SDK capture requires the option, but the processor also supports its absence.
+    monkeypatch.delitem(sentry_sdk.get_client().options, "event_scrubber")
+    event, _ = SentryProcessor(tag_keys="__all__")._get_event_and_hint(
+        {"level": "error", "event": "x", "password": "secret"}
+    )
+
+    assert event["tags"] == {"password": "secret"}
+    assert event["contexts"]["structlog"]["password"] == "secret"
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"event_scrubber": EventScrubber(denylist=["value"], recursive=True)}],
+    indirect=True,
+)
+def test_recursive_scrubbing_preserves_exception_capture(sentry_events):
+    processor = SentryProcessor(tag_keys="__all__")
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        processor(
+            None,
+            None,
+            {"level": "error", "event": "x", "exc_info": sys.exc_info(), "value": "s"},
+        )
+
+    [event] = sentry_events
+    assert event["exception"]["values"][0]["type"] == "ZeroDivisionError"
+    assert event["tags"] == {}
+    assert event["contexts"]["structlog"]["value"] == "[Filtered]"
+
+
+@pytest.mark.parametrize(
+    "sentry_events",
+    [{"event_scrubber": EventScrubber(denylist=["value"], recursive=True)}],
+    indirect=True,
+)
+def test_breadcrumb_scrubbing_is_left_to_sdk(sentry_events):
+    processor = SentryProcessor(scrub=False, tag_keys="__all__")
+    processor(None, None, {"level": "error", "event": "first", "value": "secret"})
+    processor(None, None, {"level": "error", "event": "second"})
+
+    first, second = sentry_events
+    assert first["tags"] == {"value": "secret"}
+    assert first["contexts"]["structlog"]["value"] == "secret"
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb["data"] == {"value": "[Filtered]"}
+
+
 class PausingSentryProcessor(SentryProcessor):
     def __init__(self, paused, resume, pause_on, **kwargs):
         super().__init__(**kwargs)
@@ -419,5 +965,5 @@ def test_tags_and_context_are_not_shared_between_threads(sentry_events):
     worker.join(5)
 
     [event] = sentry_events
-    assert event["tags"] == own
+    assert event["tags"] == {"request_id": "own"}
     assert event["contexts"]["structlog"] == own
