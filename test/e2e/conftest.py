@@ -17,7 +17,7 @@ def pytest_ignore_collect(collection_path, config):
 
 
 @pytest.fixture
-def e2e_server(tmp_path):
+def e2e_server(tmp_path, request):
     import requests
 
     root = Path(__file__).resolve().parents[2]
@@ -29,6 +29,7 @@ def e2e_server(tmp_path):
         port = listener.getsockname()[1]
     base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
+    env["E2E_PROCESSOR"] = request.param
     env["SENTRY_E2E_EVENTS"] = str(events_path)
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(root), env.get("PYTHONPATH")])

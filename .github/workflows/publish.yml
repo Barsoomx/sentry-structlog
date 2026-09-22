@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build and check distributions
+  check:
+    name: Check release tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -33,36 +33,13 @@ jobs:
           if actual_tag != expected_tag:
               raise SystemExit(f"Tag {actual_tag!r} does not match {expected_tag!r}")
           PY
-      - name: Build sdist and wheel
-        run: |
-          python -m pip install --upgrade build twine
-          python -m build
-      - name: Check distribution metadata
-        run: python -m twine check --strict dist/*
-      - name: Check installed wheel
-        run: |
-          python -m pip install dist/*.whl
-          python -I - <<'PY'
-          from importlib.metadata import distribution
-          from sentry_structlog import SentryProcessor
-
-          package = distribution("sentry-structlog")
-          assert package.locate_file("sentry_structlog/py.typed").is_file()
-          print(f"Installed {package.metadata['Name']} {package.version}: {SentryProcessor}")
-          PY
-      - name: Upload checked distributions
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: dist
-          path: dist/*
-          if-no-files-found: error
 
   tests:
     uses: ./.github/workflows/tests.yml
 
   publish:
     name: Publish with PyPI Trusted Publishing
-    needs: [build, tests]
+    needs: [check, tests]
     if: github.repository == 'Barsoomx/sentry-structlog' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
@@ -74,7 +51,7 @@ jobs:
       - name: Download checked distributions
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: dist
+          name: tested-distributions
           path: dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

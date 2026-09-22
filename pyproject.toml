@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentry-structlog"
-version = "3.0.0"
+version = "3.0.1"
 description = "Sentry integration for structlog (thread-safe fork of structlog-sentry)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,6 +50,7 @@ dev = [
     "ruff==0.15.17",
     "mypy==1.20.0",
     "twine>=6",
+    "pyright>=1.1.400",
 ]
 
 [tool.setuptools.packages.find]
