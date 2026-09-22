@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import warnings
 from collections.abc import Iterable, MutableMapping
 from decimal import Decimal
 from enum import Enum
@@ -121,7 +122,8 @@ class SentryProcessor:
         :param ignore_loggers: A list of logger names to ignore any events from.
         :param verbose: Report the action taken by the logger in the `event_dict`.
             Default is :obj:`False`.
-        :param scope: Optionally specify :obj:`sentry_sdk.Scope`.
+        :param scope: Deprecated pinned :obj:`sentry_sdk.Scope`; removed in 4.0.
+            Use the SDK's current or isolation scope instead.
         :param exclude_tag_keys: Additional keys to exclude from tags in either mode.
         :param scrub: Scrub context and drop sensitive tags using the client's event
             scrubber. Default is :obj:`True`. Breadcrumb scrubbing is left to the SDK.
@@ -140,40 +142,54 @@ class SentryProcessor:
         self.scrub = scrub
         self.verbose = verbose
 
+        if scope is not None:
+            warnings.warn(
+                "SentryProcessor(scope=...) is deprecated and will be removed in 4.0. "
+                "Use 'with sentry_sdk.new_scope() as scope: scope.set_client(client)' "
+                "instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._scope = scope
         self._as_context = as_context
-        self.ignore_breadcrumb_data = ignore_breadcrumb_data
-
-        self._ignored_loggers: set[str] = set()
-        if ignore_loggers is not None:
-            self._ignored_loggers.update(set(ignore_loggers))
+        self.ignore_breadcrumb_data = frozenset(ignore_breadcrumb_data)
+        self._ignored_loggers = (
+            frozenset(ignore_loggers) if ignore_loggers is not None else frozenset()
+        )
 
     @staticmethod
     def _get_logger_name(
         logger: WrappedLogger, event_dict: MutableMapping[str, Any]
     ) -> Optional[str]:
-        """Get logger name from event_dict with a fallbacks to logger.name and
-        record.name
+        """Get a non-empty string name from event_dict, record, then logger.
 
         :param logger: logger instance
         :param event_dict: structlog event_dict
         """
-        record = event_dict.get("_record")
         l_name = event_dict.get("logger")
-        logger_name = None
+        if isinstance(l_name, str) and l_name:
+            return l_name
 
-        if l_name:
-            logger_name = l_name
-        elif record and hasattr(record, "name"):
-            logger_name = record.name
+        record_name = getattr(event_dict.get("_record"), "name", None)
+        if isinstance(record_name, str) and record_name:
+            return record_name
 
-        if not logger_name and logger and hasattr(logger, "name"):
-            logger_name = logger.name
+        logger_name = getattr(logger, "name", None)
+        if isinstance(logger_name, str) and logger_name:
+            return logger_name
 
-        return logger_name
+        return None
 
     def _get_scope(self) -> Scope:
         return self._scope or get_isolation_scope()
+
+    @staticmethod
+    def _get_hint(event_dict: EventDict) -> dict[str, Any]:
+        hint: dict[str, Any] = {"structlog": dict(event_dict)}
+        record = event_dict.get("_record")
+        if isinstance(record, logging.LogRecord):
+            hint["log_record"] = record
+        return hint
 
     def _get_event_and_hint(
         self, event_dict: EventDict, original_event_dict: EventDict | None = None
@@ -240,6 +256,8 @@ class SentryProcessor:
                 if scrubber is not None and scrubber.recursive
                 else dict(original_event_dict)
             )
+            if isinstance(context.get("_record"), logging.LogRecord):
+                context.pop("_record")
             if scrubber is not None:
                 scrubber.scrub_dict(context)
             event["contexts"] = {"structlog": context}
@@ -262,11 +280,14 @@ class SentryProcessor:
                     tags[key] = tag_value
             event["tags"] = tags
 
-        return event, hint  # type: ignore[return-value]
+        return event, {**hint, **self._get_hint(original_event_dict)}  # type: ignore[return-value]
 
     def _get_breadcrumb_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
         data = {
-            k: v for k, v in event_dict.items() if k not in self.ignore_breadcrumb_data
+            k: v
+            for k, v in event_dict.items()
+            if k not in self.ignore_breadcrumb_data
+            and not (k == "_record" and isinstance(v, logging.LogRecord))
         }
         event = {
             "type": "log",
@@ -277,10 +298,9 @@ class SentryProcessor:
             "data": data,
         }
 
-        return event, {"log_record": event_dict}
+        return event, self._get_hint(event_dict)
 
-    def _can_record(self, logger: WrappedLogger, event_dict: EventDict) -> bool:
-        logger_name = self._get_logger_name(logger=logger, event_dict=event_dict)
+    def _can_record(self, logger_name: str | None, event_dict: EventDict) -> bool:
         if logger_name:
             for ignored_logger in _IGNORED_LOGGERS | self._ignored_loggers:
                 if fnmatch(logger_name, ignored_logger):  # type: ignore
@@ -294,22 +314,30 @@ class SentryProcessor:
         event_dict: EventDict,
         original_event_dict: EventDict | None = None,
         sentry_level: str | None = None,
+        logger_name: str | None = None,
     ) -> None:
         with capture_internal_exceptions():
             event, hint = self._get_event_and_hint(event_dict, original_event_dict)
+            if "logger" not in event_dict and logger_name is not None:
+                event["logger"] = logger_name
             if sentry_level is not None:
                 event["level"] = sentry_level
             sid = self._get_scope().capture_event(event, hint=hint)  # type: ignore[arg-type]
             if sid:
                 event_dict["sentry_id"] = sid
             if self.verbose:
-                event_dict["sentry"] = "sent"
+                event_dict["sentry"] = "sent" if sid else "dropped"
 
     def _handle_breadcrumb(
-        self, event_dict: EventDict, sentry_level: str | None = None
+        self,
+        event_dict: EventDict,
+        sentry_level: str | None = None,
+        logger_name: str | None = None,
     ) -> None:
         with capture_internal_exceptions():
             event, hint = self._get_breadcrumb_and_hint(event_dict)
+            if "logger" not in event_dict and logger_name is not None:
+                event["category"] = logger_name
             if sentry_level is not None:
                 event["level"] = sentry_level
             self._get_scope().add_breadcrumb(event, hint=hint)
@@ -361,17 +389,27 @@ class SentryProcessor:
                     if level is None and self.verbose:
                         event_dict["sentry"] = "skipped"
 
-                    if level is not None and self._can_record(logger, event_dict):
+                    logger_name = (
+                        self._get_logger_name(logger, event_dict)
+                        if level is not None
+                        else None
+                    )
+                    if level is not None and self._can_record(logger_name, event_dict):
                         sentry_level = self._get_sentry_level(level)
                         original_event_dict = event_dict
                         if level >= self.event_level:
                             original_event_dict = dict(event_dict)
                             self._handle_event(
-                                event_dict, original_event_dict, sentry_level
+                                event_dict,
+                                original_event_dict,
+                                sentry_level,
+                                logger_name,
                             )
 
                         if level >= self.level:
-                            self._handle_breadcrumb(original_event_dict, sentry_level)
+                            self._handle_breadcrumb(
+                                original_event_dict, sentry_level, logger_name
+                            )
 
             if self.verbose:
                 event_dict.setdefault("sentry", "skipped")
