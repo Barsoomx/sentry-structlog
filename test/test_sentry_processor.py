@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
@@ -99,10 +100,61 @@ def test_sentry_skip():
     assert event_dict.get("sentry") == "skipped"
 
 
-def test_sentry_sent():
+def test_sentry_dropped_without_client():
     processor = SentryProcessor(verbose=True)
     event_dict = processor(None, None, {"level": "error"})
-    assert event_dict.get("sentry") == "sent"
+    assert event_dict.get("sentry") == "dropped"
+    assert "sentry_id" not in event_dict
+
+
+def test_sentry_sent(sentry_events):
+    event_dict = {"level": "error", "event": "accepted"}
+
+    SentryProcessor(verbose=True)(None, "error", event_dict)
+
+    [event] = sentry_events
+    assert event_dict["sentry"] == "sent"
+    assert event_dict["sentry_id"] == event["event_id"]
+
+
+@pytest.mark.parametrize(
+    "drop_options",
+    [
+        pytest.param({"before_send": lambda event, hint: None}, id="before_send"),
+        pytest.param({"sample_rate": 0.0}, id="sample_rate"),
+    ],
+)
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize(
+    "user_metadata", [{}, {"sentry": "custom", "sentry_id": "user"}]
+)
+def test_dropped_events_preserve_data_and_breadcrumbs(
+    sentry_events, monkeypatch, drop_options, verbose, user_metadata
+):
+    processor = SentryProcessor(verbose=verbose)
+    accepted = {"level": "error", "event": "accepted"}
+    processor(None, "error", accepted)
+    [first] = sentry_events
+    assert accepted["sentry_id"] == first["event_id"]
+    original = {"level": "error", "event": "dropped", "value": "own", **user_metadata}
+    event_data = original.copy()
+
+    with monkeypatch.context() as patch:
+        for key, value in drop_options.items():
+            patch.setitem(sentry_sdk.get_client().options, key, value)
+        assert processor(None, "error", event_data) is event_data
+
+    assert len(sentry_events) == 1
+    assert event_data == {**original, **({"sentry": "dropped"} if verbose else {})}
+
+    processor(None, "error", {"level": "error", "event": "after drop"})
+    assert len(sentry_events) == 2
+    breadcrumbs = sentry_events[-1]["breadcrumbs"]["values"]
+    assert [breadcrumb["message"] for breadcrumb in breadcrumbs] == [
+        "accepted",
+        "dropped",
+    ]
+    assert breadcrumbs[-1]["data"] == {"value": "own", **user_metadata}
 
 
 @pytest.mark.parametrize(
@@ -453,6 +505,131 @@ def test_sentry_get_logger_name():
     )
 
 
+def test_capturing_logger_factory_through_processor(sentry_events):
+    factory = structlog.testing.CapturingLoggerFactory()
+    log = structlog.wrap_logger(
+        factory(),
+        processors=[structlog.stdlib.add_log_level, SentryProcessor()],
+    )
+
+    log.info("breadcrumb")
+    log.error("event")
+
+    assert [call.method_name for call in factory.logger.calls] == ["info", "error"]
+    [event] = sentry_events
+    assert event["message"] == "event"
+    assert not event.get("logger")
+    [breadcrumb] = event["breadcrumbs"]["values"]
+    assert breadcrumb["message"] == "breadcrumb"
+    assert not breadcrumb.get("category")
+
+
+@pytest.mark.parametrize("logger_factory", [structlog.testing.CapturingLogger, Mock])
+def test_dynamic_logger_names_do_not_prevent_capture(sentry_events, logger_factory):
+    event_data = {"level": "error", "event": "message"}
+    logger = logger_factory()
+
+    assert SentryProcessor()(logger, "error", event_data) is event_data
+
+    [event] = sentry_events
+    assert event["message"] == "message"
+    assert not event.get("logger")
+    assert SentryProcessor._get_logger_name(logger, event_data) is None
+
+
+def test_logger_name_is_resolved_once_for_filter_and_payloads(sentry_events):
+    names = iter(["allowed.logger", "ignored.logger"])
+
+    class ChangingNameLogger:
+        @property
+        def name(self):
+            return next(names)
+
+    processor = SentryProcessor(ignore_loggers=["ignored.*"])
+    processor(ChangingNameLogger(), "error", {"level": "error", "event": "first"})
+    processor(None, "error", {"level": "error", "event": "second"})
+
+    first, second = sentry_events
+    assert first["logger"] == "allowed.logger"
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb["category"] == "allowed.logger"
+
+
+@pytest.mark.parametrize(
+    "logger, record_name, event_name, expected_name",
+    [
+        (logging.getLogger("wrapped.logger"), absent, absent, "wrapped.logger"),
+        (Mock(), "record.logger", absent, "record.logger"),
+        (structlog.testing.CapturingLogger(), "record.logger", absent, "record.logger"),
+        (MockLogger(None), "record.logger", absent, "record.logger"),
+        (MockLogger("wrapped.logger"), "record.logger", absent, "record.logger"),
+        (MockLogger("wrapped.logger"), None, absent, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), "", absent, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), Mock(), absent, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), lambda: "name", absent, "wrapped.logger"),
+        (MockLogger("wrapped.logger"), "record.logger", "event.logger", "event.logger"),
+    ],
+)
+def test_resolved_logger_name_is_used_in_payloads(
+    sentry_events, logger, record_name, event_name, expected_name
+):
+    event_data = {"level": "error", "event": "first"}
+    if record_name is not absent:
+        event_data["_record"] = logging.LogRecord(
+            record_name, logging.ERROR, __file__, 0, "first", (), None
+        )
+    if event_name is not absent:
+        event_data["logger"] = event_name
+    original = event_data.copy()
+
+    processor = SentryProcessor()
+    processor(logger, "error", event_data)
+    processor(None, "error", {"level": "error", "event": "second"})
+
+    first, second = sentry_events
+    assert first["logger"] == expected_name
+    [breadcrumb] = second["breadcrumbs"]["values"]
+    assert breadcrumb["category"] == expected_name
+    assert {
+        key: value for key, value in event_data.items() if key != "sentry_id"
+    } == original
+    assert ("logger" in first["contexts"]["structlog"]) == (event_name is not absent)
+
+
+@pytest.mark.parametrize("event_name", [None, "", 42, Mock(), lambda: "name"])
+def test_invalid_event_logger_name_falls_back_for_ignore_filter(
+    sentry_events, event_name
+):
+    processor = SentryProcessor(ignore_loggers=["record.*"], verbose=True)
+    event_data = {
+        "level": "error",
+        "event": "ignored",
+        "logger": event_name,
+        "_record": MockLogger("record.logger"),
+    }
+
+    processor(Mock(), "error", event_data)
+
+    assert event_data["sentry"] == "ignored"
+    assert not sentry_events
+
+
+@pytest.mark.parametrize("logger_name", ["ignored.logger", "sentry_sdk.errors"])
+def test_fallback_logger_names_respect_wildcard_and_sdk_ignores(
+    sentry_events, logger_name
+):
+    processor = SentryProcessor(ignore_loggers=["ignored.*"], verbose=True)
+    event_data = {"level": "error", "event": "ignored"}
+
+    processor(logging.getLogger(logger_name), "error", event_data)
+    processor(None, "error", {"level": "error", "event": "accepted"})
+
+    assert event_data["sentry"] == "ignored"
+    [event] = sentry_events
+    assert event["message"] == "accepted"
+    assert not event.get("breadcrumbs", {}).get("values", [])
+
+
 @pytest.mark.parametrize(
     "level, severity",
     [
@@ -564,6 +741,84 @@ def test_breadcrumbs_with_custom_exclusions(sentry_events):
             "timestamp": "2024-01-01T00:00:00Z",
         },
     }
+
+
+@pytest.mark.parametrize(
+    "keys_type",
+    [
+        list,
+        tuple,
+        set,
+        frozenset,
+        iter,
+        pytest.param(lambda keys: (key for key in keys), id="generator"),
+    ],
+)
+@pytest.mark.parametrize("secret_first", [False, True])
+def test_breadcrumb_exclusions_accept_iterables_for_repeated_logs(
+    sentry_events, keys_type, secret_first
+):
+    processor = SentryProcessor(ignore_breadcrumb_data=keys_type(["secret"]))
+    for message in ("first", "second"):
+        event_data = {"level": "info", "event": message, "secret": "hidden"}
+        if secret_first:
+            event_data = {"secret": "hidden", "level": "info", "event": message}
+        processor(None, "info", event_data)
+    processor(None, "error", {"level": "error", "event": "capture"})
+
+    [event] = sentry_events
+    assert [breadcrumb["data"] for breadcrumb in event["breadcrumbs"]["values"]] == [
+        {"level": "info", "event": "first"},
+        {"level": "info", "event": "second"},
+    ]
+
+
+@pytest.mark.parametrize("keys_type", [list, set])
+def test_breadcrumb_exclusions_are_copied_at_construction(sentry_events, keys_type):
+    exclusions = keys_type(["secret"])
+    processor = SentryProcessor(ignore_breadcrumb_data=exclusions)
+    exclusions.clear()
+
+    processor(None, "info", {"level": "info", "event": "first", "secret": "hidden"})
+    processor(None, "error", {"level": "error", "event": "capture"})
+
+    [event] = sentry_events
+    [breadcrumb] = event["breadcrumbs"]["values"]
+    assert breadcrumb["data"] == {"level": "info", "event": "first"}
+
+
+@pytest.mark.parametrize(
+    "keys_type",
+    [
+        list,
+        tuple,
+        set,
+        frozenset,
+        iter,
+        pytest.param(lambda keys: (key for key in keys), id="generator"),
+    ],
+)
+def test_ignore_loggers_accept_iterables_for_repeated_logs(sentry_events, keys_type):
+    processor = SentryProcessor(ignore_loggers=keys_type(["ignored.*"]), verbose=True)
+    for message in ("first", "second"):
+        event_data = {"level": "error", "event": message, "logger": "ignored.logger"}
+        processor(None, "error", event_data)
+        assert event_data["sentry"] == "ignored"
+
+    assert not sentry_events
+
+
+@pytest.mark.parametrize("keys_type", [list, set])
+def test_ignore_loggers_are_copied_at_construction(sentry_events, keys_type):
+    exclusions = keys_type(["ignored.*"])
+    processor = SentryProcessor(ignore_loggers=exclusions, verbose=True)
+    exclusions.clear()
+    event_data = {"level": "error", "event": "ignored", "logger": "ignored.logger"}
+
+    processor(None, "error", event_data)
+
+    assert event_data["sentry"] == "ignored"
+    assert not sentry_events
 
 
 def test_breadcrumbs_with_no_additional_data(sentry_events):
@@ -937,11 +1192,11 @@ class PausingSentryProcessor(SentryProcessor):
         self.resume = resume
         self.pause_on = pause_on
 
-    def _can_record(self, logger, event_dict):
+    def _can_record(self, logger_name, event_dict):
         if event_dict["event"] == self.pause_on:
             self.paused.set()
             self.resume.wait(5)
-        return super()._can_record(logger, event_dict)
+        return super()._can_record(logger_name, event_dict)
 
 
 def test_tags_and_context_are_not_shared_between_threads(sentry_events):

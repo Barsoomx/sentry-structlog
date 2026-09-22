@@ -66,8 +66,14 @@ log = structlog.get_logger()
 ```
 
 Add `structlog.stdlib.add_log_level` (or `structlog.stdlib.add_log_level_number`)
-and optionally `structlog.stdlib.add_logger_name` before `SentryProcessor`. The
-`SentryProcessor` class takes the following arguments:
+and optionally `structlog.stdlib.add_logger_name` before `SentryProcessor`.
+Logger names are resolved from non-empty strings in `event_dict["logger"]`,
+`_record.name`, then the wrapped logger's `name`. If the event dict has no
+`logger` key, the resolved name supplies the Sentry event logger and breadcrumb
+category without changing the original event data. Loggers without a string
+name, including `structlog.testing.CapturingLogger`, are supported.
+
+The `SentryProcessor` class takes the following arguments:
 
 - `level` Events of this or higher levels will be reported as Sentry
   breadcrumbs. Default is `logging.INFO`.
@@ -75,11 +81,13 @@ and optionally `structlog.stdlib.add_logger_name` before `SentryProcessor`. The
   as events. Default is `logging.WARNING`.
 - `active` A flag to make this processor enabled/disabled.
 - `as_context` Send `event_dict` as extra info to Sentry. Default is `True`.
-- `ignore_breadcrumb_data` A list of data keys that will be excluded from
+- `ignore_breadcrumb_data` Any iterable of data keys that will be excluded from
   [breadcrumb data](https://docs.sentry.io/platforms/python/enriching-events/breadcrumbs/#manual-breadcrumbs).
   Defaults to keys which are already sent separately, i.e. `level`, `logger`,
   `event` and `timestamp`. All other data in `event_dict` will be sent as
-  breadcrumb data.
+  breadcrumb data. Copied into a `frozenset` at construction, so iterators can be
+  used safely across calls and later changes to the source collection have no
+  effect. This option does not exclude keys from contexts or tags.
 - `tag_keys` Any iterable of keys to send as tags (including lists, tuples, sets,
   and generators), or `"__all__"` for all eligible keys. Defaults to `None` (no
   structlog tags). Any other string raises `ValueError` during construction.
@@ -87,11 +95,21 @@ and optionally `structlog.stdlib.add_logger_name` before `SentryProcessor`. The
   Defaults to `()`.
 - `scrub` Apply the client's event scrubber to `contexts.structlog` and remove
   denylisted tags. Defaults to `True`.
-- `ignore_loggers` A list of logger names to ignore any events from.
+- `ignore_loggers` Any iterable of logger names or wildcard patterns to ignore
+  any events from. Copied into a `frozenset` at construction.
 - `verbose` Report the action taken by the logger in the `event_dict`.
   Default is `False`.
 - `scope` Optionally specify `sentry_sdk.Client` (in upstream `structlog-sentry<2.2`
   this corresponds to `hub: sentry_sdk.Hub`).
+
+With `verbose=True`, `sentry="sent"` means the SDK returned an event ID, which is
+also added as `sentry_id`. This indicates SDK acceptance, not guaranteed network
+delivery. `sentry="dropped"` means the SDK returned no event ID; no `sentry_id` is
+added, and the SDK's reason is not inferred. `sentry="ignored"` marks an ignored
+logger, while `sentry="skipped"` covers disabled processing, `sentry_skip`, and
+level filtering. Breadcrumbs are recorded independently according to `level`,
+even when the SDK drops an event. With `verbose=False`, user-supplied `sentry`
+metadata is left unchanged.
 
 ### Log levels
 
