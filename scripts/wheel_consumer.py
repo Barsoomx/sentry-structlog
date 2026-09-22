@@ -54,7 +54,9 @@ def before_send(event: Event, hint: Hint) -> Event | None:
     original: EventDict = hint["structlog"]
     assert original["request_id"] == "wheel-consumer"
     assert original["password"] == "example"
+    assert "tags" in event
     assert event["tags"] == {"request_id": "wheel-consumer"}
+    assert "contexts" in event
     assert event["contexts"]["structlog"]["password"] == "[Filtered]"
     captured.append(event)
     return None

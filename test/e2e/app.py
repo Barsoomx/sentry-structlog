@@ -5,6 +5,7 @@ import logging
 import logging.config
 import os
 import threading
+import time
 from pathlib import Path
 
 import sentry_sdk
@@ -19,6 +20,27 @@ from sentry_sdk.scrubber import EventScrubber
 from sentry_sdk.transport import Transport
 
 from sentry_structlog import SentryProcessor
+
+
+class UpstreamLikeProcessor(SentryProcessor):
+    """Expose the 2.2.1 shared-snapshot race within the 3.0.0 pipeline."""
+
+    def __call__(self, logger, name, event_dict):
+        self._original_event_dict = dict(event_dict)
+        return super().__call__(logger, name, event_dict)
+
+    def _get_event_and_hint(self, event_dict, original_event_dict=None):
+        time.sleep(0.001)
+        # The shared snapshot feeds both context and tags, with current filtering.
+        event, hint = super()._get_event_and_hint(event_dict, self._original_event_dict)
+        # Preserve the fork's per-call hint; only context and tags model the race.
+        hint.pop("log_record", None)
+        hint.update(
+            self._get_hint(
+                original_event_dict if original_event_dict is not None else event_dict
+            )
+        )
+        return event, hint
 
 
 class JsonlFileTransport(Transport):
@@ -56,6 +78,11 @@ sentry_sdk.init(
     ],
 )
 
+processor_class = (
+    UpstreamLikeProcessor
+    if os.environ.get("E2E_PROCESSOR", "fork") == "upstream"
+    else SentryProcessor
+)
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -65,7 +92,7 @@ structlog.configure(
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.StackInfoRenderer(),
-        SentryProcessor(
+        processor_class(
             event_level=logging.ERROR,
             as_context=True,
             tag_keys="__all__",

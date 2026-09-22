@@ -37,6 +37,25 @@ jobs:
         run: uv run --no-sync ruff format --check .
       - name: Mypy type check
         run: uv run --no-sync mypy sentry_structlog
+      - name: Check invalid API calls remain rejected
+        run: uv run --no-sync mypy --strict --warn-unused-ignores --python-version 3.10 scripts/typing_negative.py
+
+  pyright:
+    name: Pyright type check
+    runs-on: ubuntu-latest
+    # TODO(#36): fix package _NAME_TO_LEVEL import and Event assignment diagnostics.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python -m pip install "uv==$UV_VERSION"
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --python 3.12
+      - name: Pyright package and consumer checks
+        run: uv run --no-sync pyright --pythonversion 3.10 sentry_structlog scripts/wheel_consumer.py scripts/typing_negative.py
 
   test:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
@@ -106,6 +125,10 @@ jobs:
         run: python -m pip install "uv==$UV_VERSION"
       - name: Install locked tooling
         run: uv sync --locked --all-groups --python 3.10
+      - name: Install built wheel without changing lane dependencies
+        run: |
+          uv build --wheel
+          uv pip install --reinstall --no-deps dist/*.whl
       - name: Install minimum runtime dependencies
         if: matrix.endpoint == 'min'
         run: uv pip install "sentry-sdk==2.15.0" "structlog==23.1.0"
@@ -117,6 +140,12 @@ jobs:
       # Do not let uv run restore the locked versions after selecting an endpoint.
       - name: Run endpoint tests with coverage and JUnit
         run: uv run --no-sync pytest --cov --cov-report=term-missing --cov-report=xml --junitxml=junit.xml
+      - name: Check installed wheel and consumer typing with lane dependencies
+        run: |
+          cp scripts/wheel_consumer.py "$RUNNER_TEMP/wheel_consumer.py"
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.venv/bin/python" -I wheel_consumer.py
+          "$GITHUB_WORKSPACE/.venv/bin/python" -I -m mypy --strict --python-version 3.10 wheel_consumer.py
       - name: Upload coverage and test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

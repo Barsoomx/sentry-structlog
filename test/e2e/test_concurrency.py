@@ -8,6 +8,21 @@ import requests
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize(
+    "e2e_server",
+    [
+        "fork",
+        pytest.param(
+            "upstream",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="upstream shared snapshot leaks foreign markers",
+            ),
+        ),
+    ],
+    indirect=True,
+)
 def test_concurrent_requests_keep_tags_context_and_breadcrumbs_isolated(e2e_server):
     base_url, events_path = e2e_server
     markers = [uuid4().hex for _ in range(500)]

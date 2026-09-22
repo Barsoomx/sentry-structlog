@@ -15,10 +15,11 @@ docker compose run --rm e2e
 ```
 
 The default `uv run pytest` excludes this marker and skips collecting the e2e
-module. The explicit command starts one Granian WSGI worker with eight blocking
-threads, sends 500 requests from 32 client threads, and stops the server even on
-failure. No Sentry server is needed: a synchronous, locked JSONL transport writes
-events in pytest's temporary directory alongside `granian.log`.
+module. For each processor variant, the explicit command starts one Granian WSGI
+worker with eight blocking threads, sends 500 requests from 32 client threads, and
+stops the server even on failure. No Sentry server is needed: a synchronous, locked
+JSONL transport writes events in pytest's temporary directory alongside
+`granian.log`.
 
 Assertions tie each event to Django's recorded request query string and the HTTP
 response, checking marker/request ID isolation, recursive phone scrubbing, tag
@@ -26,11 +27,15 @@ exclusions, plain-error stack behavior, and request breadcrumbs. The recorded
 request is an independent reference: matching tags and context alone would miss
 both being replaced by the same foreign request.
 
-The upstream 2.2.1 algorithm (git commit `31fa5e3`) assigned
-`self._original_event_dict = dict(event_dict)` on every log call and copied that
-shared attribute into tags. A mutation check in a disposable `/tmp` copy restored
-that assignment and made tag iteration read the shared attribute. A 1 ms yield
-before that read exposed the race: the unchanged e2e failed, with 375 foreign tag
-markers and 107 missing markers among 500 events. Current privacy filtering was
-kept, isolating the concurrency defect. Without the scheduling yield, that run
-passed; a finite load test cannot guarantee every possible thread interleaving.
+The test runs both `fork` and `upstream` variants, selected in the server with
+`E2E_PROCESSOR` (default: `fork`). `UpstreamLikeProcessor` reproduces the upstream
+2.2.1 shared-snapshot algorithm: every log call assigns
+`self._original_event_dict = dict(event_dict)` on the processor instance. A
+`time.sleep(0.001)` yield before reading that attribute for `contexts.structlog`
+and `"__all__"` tags exposes foreign request markers under concurrent load. The
+rest of the 3.0.0 pipeline, including privacy filtering, stays in place.
+
+The fork must pass. The upstream case is a negative canary marked
+`xfail(strict=True, raises=AssertionError)`: expected output is **1 passed,
+1 xfailed**. An upstream XPASS fails the run because the scenario no longer
+detects the race; server startup and other non-assertion errors also fail the run.
