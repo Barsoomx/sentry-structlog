@@ -1,10 +1,11 @@
 import logging
+import threading
 from dataclasses import dataclass
 
 import pytest
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
-from structlog_sentry import SentryProcessor
+from sentry_structlog import SentryProcessor
 
 INTEGRATIONS = [
     LoggingIntegration(event_level=None, level=None),
@@ -380,3 +381,42 @@ def test_breadcrumbs_with_no_additional_data(sentry_events):
         "message": "Info message",
         "data": {},
     }
+
+
+class PausingSentryProcessor(SentryProcessor):
+    def __init__(self, paused, resume, pause_on, **kwargs):
+        super().__init__(**kwargs)
+        self.paused = paused
+        self.resume = resume
+        self.pause_on = pause_on
+
+    def _can_record(self, logger, event_dict):
+        if event_dict["event"] == self.pause_on:
+            self.paused.set()
+            self.resume.wait(5)
+        return super()._can_record(logger, event_dict)
+
+
+def test_tags_and_context_are_not_shared_between_threads(sentry_events):
+    paused, resume = threading.Event(), threading.Event()
+    processor = PausingSentryProcessor(
+        paused,
+        resume,
+        pause_on="own error",
+        event_level=logging.ERROR,
+        tag_keys="__all__",
+        scope=sentry_sdk.get_isolation_scope(),
+    )
+    own = {"level": "error", "event": "own error", "request_id": "own"}
+    foreign = {"level": "info", "event": "request_finished", "request_id": "foreign"}
+
+    worker = threading.Thread(target=processor, args=(None, None, dict(own)))
+    worker.start()
+    assert paused.wait(5)
+    processor(None, None, dict(foreign))
+    resume.set()
+    worker.join(5)
+
+    [event] = sentry_events
+    assert event["tags"] == own
+    assert event["contexts"]["structlog"] == own

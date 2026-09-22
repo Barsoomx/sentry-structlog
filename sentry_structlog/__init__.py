@@ -76,7 +76,6 @@ class SentryProcessor:
 
         self._scope = scope
         self._as_context = as_context
-        self._original_event_dict: dict = {}
         self.ignore_breadcrumb_data = ignore_breadcrumb_data
 
         self._ignored_loggers: set[str] = set()
@@ -110,11 +109,19 @@ class SentryProcessor:
     def _get_scope(self) -> Scope:
         return self._scope or get_isolation_scope()
 
-    def _get_event_and_hint(self, event_dict: EventDict) -> tuple[dict, dict]:
+    def _get_event_and_hint(
+        self, event_dict: EventDict, original_event_dict: EventDict | None = None
+    ) -> tuple[dict, dict]:
         """Create a sentry event and hint from structlog `event_dict` and sys.exc_info.
 
         :param event_dict: structlog event_dict
+        :param original_event_dict: snapshot of `event_dict` taken before any
+            mutation by this processor; used for tags and context. Defaults to
+            `event_dict` itself.
         """
+        if original_event_dict is None:
+            original_event_dict = event_dict
+
         exc_info = _figure_out_exc_info(event_dict.get("exc_info", None))
         has_exc_info = exc_info and exc_info != (None, None, None)
 
@@ -134,9 +141,9 @@ class SentryProcessor:
             event["logger"] = event_dict["logger"]
 
         if self._as_context:
-            event["contexts"] = {"structlog": self._original_event_dict.copy()}
+            event["contexts"] = {"structlog": dict(original_event_dict)}
         if self.tag_keys == "__all__":
-            event["tags"] = self._original_event_dict.copy()
+            event["tags"] = dict(original_event_dict)
         if isinstance(self.tag_keys, list):
             event["tags"] = {
                 key: event_dict[key] for key in self.tag_keys if key in event_dict
@@ -169,9 +176,11 @@ class SentryProcessor:
                     return False
         return True
 
-    def _handle_event(self, event_dict: EventDict) -> None:
+    def _handle_event(
+        self, event_dict: EventDict, original_event_dict: EventDict | None = None
+    ) -> None:
         with capture_internal_exceptions():
-            event, hint = self._get_event_and_hint(event_dict)
+            event, hint = self._get_event_and_hint(event_dict, original_event_dict)
             sid = self._get_scope().capture_event(event, hint=hint)
             if sid:
                 event_dict["sentry_id"] = sid
@@ -202,14 +211,14 @@ class SentryProcessor:
         self, logger: WrappedLogger, name: str, event_dict: EventDict
     ) -> EventDict:
         """A middleware to process structlog `event_dict` and send it to Sentry."""
-        self._original_event_dict = dict(event_dict)
+        original_event_dict = dict(event_dict)
         sentry_skip = event_dict.pop("sentry_skip", False)
 
         if self.active and not sentry_skip and self._can_record(logger, event_dict):
             level = self._get_level_value(event_dict["level"].upper())
 
             if level >= self.event_level:
-                self._handle_event(event_dict)
+                self._handle_event(event_dict, original_event_dict)
 
             if level >= self.level:
                 self._handle_breadcrumb(event_dict)

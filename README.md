@@ -1,9 +1,21 @@
-# structlog-sentry
+# sentry-structlog
 
 | What          | Where                                         |
 | ------------- | --------------------------------------------- |
-| Documentation | <https://github.com/kiwicom/structlog-sentry> |
-| Maintainer    | @kiwicom/platform                             |
+| Documentation | <https://github.com/Barsoomx/sentry-structlog> |
+| Maintainer    | @Barsoomx                                       |
+| Upstream      | <https://github.com/kiwicom/structlog-sentry>  |
+
+Fork of [kiwicom/structlog-sentry](https://github.com/kiwicom/structlog-sentry) (MIT),
+renamed to `sentry-structlog` (import name `sentry_structlog`).
+
+Differences from upstream:
+
+- `SentryProcessor` is thread-safe: tags and the `structlog` context of an event
+  are built from the event dict of the current call. Upstream keeps the last
+  event dict on the shared processor instance, so under multi-threaded servers
+  (granian, gunicorn threads, celery threads) an error could be reported with
+  tags and context of an unrelated log line from another thread.
 
 Based on <https://gist.github.com/hynek/a1f3f92d57071ebc5b91>
 
@@ -12,8 +24,18 @@ Based on <https://gist.github.com/hynek/a1f3f92d57071ebc5b91>
 Install the package with [pip](https://pip.pypa.io/):
 
 ```
-pip install structlog-sentry
+pip install sentry-structlog
 ```
+
+## Migrating from structlog-sentry
+
+```
+pip uninstall structlog-sentry
+pip install sentry-structlog
+```
+
+and replace `from structlog_sentry import SentryProcessor` with
+`from sentry_structlog import SentryProcessor`. Constructor arguments are unchanged.
 
 ## Usage
 
@@ -22,7 +44,7 @@ This module is intended to be used with `structlog` like this:
 ```python
 import sentry_sdk
 import structlog
-from structlog_sentry import SentryProcessor
+from sentry_structlog import SentryProcessor
 
 
 sentry_sdk.init()  # pass dsn in argument or via SENTRY_DSN env variable
@@ -62,7 +84,7 @@ Do not forget to add the `structlog.stdlib.add_log_level` and optionally the
 - `ignore_loggers` A list of logger names to ignore any events from.
 - `verbose` Report the action taken by the logger in the `event_dict`.
   Default is `False`.
-- `scope` Optionally specify `sentry_sdk.Client` (in `structlog-sentry<2.2`
+- `scope` Optionally specify `sentry_sdk.Client` (in upstream `structlog-sentry<2.2`
   this corresponds to `hub: sentry_sdk.Hub`).
 
 Now events are automatically captured by Sentry with `log.error()`:

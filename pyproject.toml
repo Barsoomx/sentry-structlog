@@ -1,12 +1,12 @@
 [tool.poetry]
-name = "structlog-sentry"
-version = "2.2.1"
-description = "Sentry integration for structlog"
+name = "sentry-structlog"
+version = "3.0.0"
+description = "Sentry integration for structlog (thread-safe fork of structlog-sentry)"
 authors = ["Kiwi.com platform <platform@kiwi.com>"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/kiwicom/structlog-sentry"
-homepage = "https://github.com/kiwicom/structlog-sentry"
+repository = "https://github.com/Barsoomx/sentry-structlog"
+homepage = "https://github.com/Barsoomx/sentry-structlog"
 
 classifiers=[
     "Development Status :: 5 - Production/Stable",
@@ -23,7 +23,7 @@ classifiers=[
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-include = ["*.md", "*.toml", "*.txt", "*.yml", "*.yaml", ".coveragerc", "tox.ini", "structlog_sentry/py.typed"]
+include = ["*.md", "*.toml", "*.txt", "*.yml", "*.yaml", ".coveragerc", "tox.ini", "sentry_structlog/py.typed"]
 
 [tool.poetry.dependencies]
 python = "^3.7"
